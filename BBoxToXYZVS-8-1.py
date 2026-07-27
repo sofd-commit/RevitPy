@@ -830,7 +830,6 @@ def is_plausible_beam_section(val, length_val):
         return True
     if nearly_equal_len(val, length_val):
         return False
-    # Запас на короткие балки: отсекаем только почти-длину (>= 95% l)
     try:
         if float(val) >= float(length_val) * 0.95:
             return False
@@ -838,34 +837,156 @@ def is_plausible_beam_section(val, length_val):
         return False
     return True
 
+def get_beam_section_from_structural_api(type_elem):
+    """Ширина/высота сечения из Structural Section API и common built-in параметров типа.
+    Возвращает (width, height, source) — любой из width/height может быть None."""
+    if type_elem is None:
+        return (None, None, None)
+
+    width = None
+    height = None
+    src_parts = []
+
+    # 1) Built-in common section params (самый стабильный путь для балок Revit)
+    w_bip = first_found([
+        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_WIDTH")),
+        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_WIDTH")),
+    ])
+    h_bip = first_found([
+        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_HEIGHT")),
+        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_HEIGHT")),
+    ])
+    d_bip = first_found([
+        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_DIAMETER")),
+        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_OUTER_DIAMETER")),
+    ])
+    if w_bip is not None:
+        width = w_bip[0]
+        src_parts.append(w_bip[1])
+    if h_bip is not None:
+        height = h_bip[0]
+        src_parts.append(h_bip[1])
+    if width is None and height is None and d_bip is not None:
+        return (d_bip[0], d_bip[0], u"StructuralSection diameter: {0}".format(d_bip[1]))
+
+    # 2) GetStructuralSection().Width / .Height (если семейство поддерживает)
+    if width is None or height is None:
+        ss = None
+        try:
+            fam = type_elem.Family
+            can = True
+            try:
+                can = fam.CanHaveStructuralSection()
+            except:
+                can = True
+            if can:
+                ss = type_elem.GetStructuralSection()
+        except:
+            ss = None
+        if ss is not None:
+            if width is None:
+                try:
+                    wv = ss.Width
+                    if is_positive_number(wv):
+                        width = wv
+                        src_parts.append(u"StructuralSection.Width")
+                except:
+                    pass
+            if height is None:
+                try:
+                    hv = ss.Height
+                    if is_positive_number(hv):
+                        height = hv
+                        src_parts.append(u"StructuralSection.Height")
+                except:
+                    pass
+            if width is None and height is None:
+                try:
+                    dv = ss.Diameter
+                    if is_positive_number(dv):
+                        return (dv, dv, u"StructuralSection.Diameter")
+                except:
+                    pass
+
+    if width is None and height is None:
+        return (None, None, None)
+    return (width, height, u"struct: {0}".format(u", ".join(src_parts)))
+
+# Имена параметров сечения балки (без двусмысленных вроде h1)
+BEAM_WIDTH_PARAM_NAMES = [
+    u"Ширина", u"Width", u"b", u"bf", u"B", u"b_фл", u"Ширина полки",
+]
+BEAM_HEIGHT_PARAM_NAMES = [
+    u"Высота", u"Height", u"h", u"H", u"ht", u"Высота сечения", u"d",
+]
+
 def framing_section_from_bbox(el, length_val):
-    """Две стороны сечения: исключаем ось, совпадающую с длиной; берём две меньшие.
-    Возвращает (width, height, source) или (None, None, None).
-    width <= height по величине (меньшая/большая сторона сечения)."""
+    """Сечение балки из bbox: исключаем ось длины, затем
+    Y→ширина (x), Z→высота (z) — типичная СК семейства балки Revit.
+    Если длина в bbox не видна (короткий символьный солид) — две наибольшие стороны.
+    Возвращает (width, height, source)."""
     dims = get_local_bbox_dimensions(el)
     if dims is None:
         dims = get_bbox_dimensions(el)
     if dims is None:
         return (None, None, None)
 
-    vals = [dims[k] for k in ("x", "y", "z") if is_positive_number(dims.get(k))]
-    if not vals:
+    items = [(k, float(dims[k])) for k in ("x", "y", "z") if is_positive_number(dims.get(k))]
+    if len(items) < 2:
         return (None, None, None)
 
+    length_key = None
     if length_val is not None:
-        filtered = [v for v in vals
-                    if not nearly_equal_len(v, length_val) and float(v) < float(length_val) * 0.95]
-        if len(filtered) >= 2:
-            vals = filtered
-        # если фильтр съел слишком много — откатываемся к двум минимальным из всех
-    vals = sorted(vals)
-    if len(vals) < 2:
+        for k, v in items:
+            if nearly_equal_len(v, length_val) or v >= float(length_val) * 0.95:
+                length_key = k
+                break
+
+    # Если одна сторона явно длиннее двух других — это длина
+    if length_key is None and len(items) == 3:
+        ordered = sorted(items, key=lambda kv: kv[1])
+        if ordered[2][1] > ordered[1][1] * 2.0:
+            length_key = ordered[2][0]
+
+    section_items = [(k, v) for k, v in items if k != length_key]
+
+    # Символ без длины вдоль оси: три размера профиля → берём две наибольшие (отбрасываем тонкую стенку)
+    if len(section_items) < 2 and length_key is None and len(items) == 3:
+        section_items = sorted(items, key=lambda kv: kv[1])[1:]
+    elif length_key is None and len(items) == 3:
+        # длина не найдена, но и нет явного «длинного» ребра — две наибольшие
+        max_dim = max(v for _, v in items)
+        if length_val is not None and max_dim < float(length_val) * 0.5:
+            section_items = sorted(items, key=lambda kv: kv[1])[1:]
+
+    if len(section_items) < 2:
         return (None, None, None)
 
-    # Две меньшие стороны = сечение; наибольшая (если осталась) = длина вдоль оси
-    width = vals[0]
-    height = vals[1]
-    return (width, height, u"local bbox (сечение: две меньшие стороны, длина исключена)")
+    smap = dict(section_items)
+    # Конвенция семейства балки Revit: после исключения длины
+    #   Y = ширина сечения → параметр x
+    #   Z = высота сечения → параметр z
+    if "y" in smap and "z" in smap:
+        width, height = smap["y"], smap["z"]
+        src = u"local bbox (Y→ширина/x, Z→высота/z)"
+    elif "x" in smap and "z" in smap:
+        width, height = smap["x"], smap["z"]
+        src = u"local bbox (X→ширина/x, Z→высота/z)"
+    elif "x" in smap and "y" in smap:
+        width, height = smap["x"], smap["y"]
+        src = u"local bbox (X→ширина/x, Y→высота/z)"
+    else:
+        ordered_vals = sorted(v for _, v in section_items)
+        width, height = ordered_vals[0], ordered_vals[-1]
+        src = u"local bbox (min→ширина, max→высота)"
+
+    if not is_plausible_beam_section(width, length_val):
+        width = None
+    if not is_plausible_beam_section(height, length_val):
+        height = None
+    if width is None and height is None:
+        return (None, None, None)
+    return (width, height, src)
 
 def strategy_structural_framing(el, type_elem):
     """Балки/каркас:
@@ -874,7 +995,10 @@ def strategy_structural_framing(el, type_elem):
     z = высота сечения,
     y = Н/П.
 
-    Важно: у line-based семейств локальный bbox.X часто = длина. Нельзя писать bbox.X в x.
+    Порядок для x/z:
+      1) STRUCTURAL_SECTION_COMMON_WIDTH/HEIGHT + GetStructuralSection
+      2) параметры типа (Ширина/b, Высота/h)
+      3) bbox: ось длины исключается; Y→x, Z→z
     """
     result = {}
 
@@ -891,43 +1015,44 @@ def strategy_structural_framing(el, type_elem):
     if length is not None:
         result["l"] = length
 
-    # Кандидаты сечения из параметров — только если значение не похоже на длину
-    width = first_found([
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM")),
-        get_val_inst_or_type(el, type_elem, bip("GENERIC_WIDTH")),
-        get_lookup_double(el, type_elem, SECTION_WIDTH_NAMES),
-    ])
-    height = first_found([
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
-        get_val_inst_or_type(el, type_elem, bip("GENERIC_HEIGHT")),
-        get_lookup_double(el, type_elem, SECTION_HEIGHT_NAMES),
-    ])
-    if width is not None and is_plausible_beam_section(width[0], length_val):
-        result["x"] = width
-    if height is not None and is_plausible_beam_section(height[0], length_val):
-        result["z"] = height
+    # 1) Structural Section API / common BIP
+    sw, sh, ssrc = get_beam_section_from_structural_api(type_elem)
+    if sw is not None and is_plausible_beam_section(sw, length_val):
+        result["x"] = (sw, ssrc)
+    if sh is not None and is_plausible_beam_section(sh, length_val):
+        result["z"] = (sh, ssrc)
 
-    # Фолбэк / санация: сечение из bbox (две меньшие стороны)
-    need_bbox = ("x" not in result) or ("z" not in result)
-    # Также если параметр всё же протащил длину в одну из осей
-    if "x" in result and length_val is not None and not is_plausible_beam_section(result["x"][0], length_val):
-        result.pop("x", None)
-        need_bbox = True
-    if "z" in result and length_val is not None and not is_plausible_beam_section(result["z"][0], length_val):
-        result.pop("z", None)
-        need_bbox = True
+    # 2) Параметры типа/экземпляра
+    if "x" not in result:
+        width = first_found([
+            get_lookup_double(el, type_elem, BEAM_WIDTH_PARAM_NAMES),
+            get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM")),
+            get_val_inst_or_type(el, type_elem, bip("GENERIC_WIDTH")),
+        ])
+        if width is not None and is_plausible_beam_section(width[0], length_val):
+            result["x"] = width
 
-    if need_bbox:
+    if "z" not in result:
+        height = first_found([
+            get_lookup_double(el, type_elem, BEAM_HEIGHT_PARAM_NAMES),
+            get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
+            get_val_inst_or_type(el, type_elem, bip("GENERIC_HEIGHT")),
+        ])
+        if height is not None and is_plausible_beam_section(height[0], length_val):
+            result["z"] = height
+
+    # 3) Bbox с правильной привязкой осей (не «две меньшие по размеру»)
+    if ("x" not in result) or ("z" not in result):
         bw, bh, bsrc = framing_section_from_bbox(el, length_val)
         if bw is not None and "x" not in result:
             result["x"] = (bw, bsrc)
         if bh is not None and "z" not in result:
             result["z"] = (bh, bsrc)
 
-    # Финальная защита: x или z не должны равняться l
+    # Финальная защита от длины в x/z
     if length_val is not None:
         for axis in ("x", "z"):
-            if axis in result and nearly_equal_len(result[axis][0], length_val):
+            if axis in result and not is_plausible_beam_section(result[axis][0], length_val):
                 result.pop(axis, None)
         if ("x" not in result) or ("z" not in result):
             bw, bh, bsrc = framing_section_from_bbox(el, length_val)
