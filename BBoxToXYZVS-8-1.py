@@ -56,11 +56,17 @@
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
 #
+#   Mechanical/Electrical/Plumbing/Speciality/... Equipment,
+#   Furniture, FurnitureSystems, Casework, GenericModel:
+#     Стабильный типоразмер в плане (чтобы спецификация схлопывала один размер):
+#       x (Ширина)  = min(план.A, план.B),
+#       y (Глубина) = max(план.A, план.B),
+#       z (Высота)  = высота.
+#     Сначала Revit BIP Width/Depth/Height, иначе локальный bbox (X/Y план, Z высота),
+#     иначе мировой AABB. Поворот экземпляра в плане не должен менять x↔y.
+#
 #   Stairs, StairsRailing, Ramps, CurtainSystem:
 #     Исключены (составная геометрия). Элемент -> skipped_unsupported.
-#
-#   Остальное (Furniture, Casework, Generic Models, Equipment и т.д.):
-#     BIP_CANDIDATES -> локальный bbox символа.
 #
 # Параметры проекта: x/y/z/l (Длина), v (Объём), s (Площадь).
 # Опционально IN[2]/IN[3]: копирование в текстовые ПИМ_Размер_*.
@@ -489,6 +495,18 @@ CAT = {
     "StructuralFraming": catid("OST_StructuralFraming"),
     "CurtainWallPanels": catid("OST_CurtainWallPanels"),
     "CurtainWallMullions": catid("OST_CurtainWallMullions"),
+    "MechanicalEquipment": catid("OST_MechanicalEquipment"),
+    "ElectricalEquipment": catid("OST_ElectricalEquipment"),
+    "PlumbingEquipment": catid("OST_PlumbingEquipment"),
+    "SpecialityEquipment": catid("OST_SpecialityEquipment"),
+    "MedicalEquipment": catid("OST_MedicalEquipment"),
+    "FoodServiceEquipment": catid("OST_FoodServiceEquipment"),
+    "Furniture": catid("OST_Furniture"),
+    "FurnitureSystems": catid("OST_FurnitureSystems"),
+    "Casework": catid("OST_Casework"),
+    "GenericModel": catid("OST_GenericModel"),
+    "PlumbingFixtures": catid("OST_PlumbingFixtures"),
+    "LightingFixtures": catid("OST_LightingFixtures"),
 }
 
 # --- 5a. Doors / Windows (проёмы) ---
@@ -1523,6 +1541,119 @@ def strategy_curtain_mullion(el, type_elem):
             result["y"] = (vals[1][1], u"local bbox (mullion section)")
     return result
 
+# --- 5i. Equipment / furniture / casework / generic (стабильный план) ---
+
+EQUIPMENT_WIDTH_BIP_NAMES = [
+    "GENERIC_WIDTH",
+    "FAMILY_WIDTH_PARAM",
+    "INSTANCE_WIDTH_PARAM",
+    "CASEWORK_WIDTH",
+    "FURNITURE_WIDTH",
+]
+EQUIPMENT_DEPTH_BIP_NAMES = [
+    "GENERIC_DEPTH",
+    "CASEWORK_DEPTH",
+    "FURNITURE_DEPTH",
+]
+EQUIPMENT_HEIGHT_BIP_NAMES = [
+    "GENERIC_HEIGHT",
+    "FAMILY_HEIGHT_PARAM",
+    "INSTANCE_HEIGHT_PARAM",
+    "CASEWORK_HEIGHT",
+    "FURNITURE_HEIGHT",
+]
+
+def normalize_plan_width_depth(plan_a, plan_b):
+    """Стабильный типоразмер в плане: Ширина=min, Глубина=max.
+    Один и тот же габарит 40×1475 не зависит от угла поворота / осей семейства."""
+    vals = []
+    if is_positive_number(plan_a):
+        vals.append(plan_a)
+    if is_positive_number(plan_b):
+        vals.append(plan_b)
+    if len(vals) == 2:
+        return (min(vals[0], vals[1]), max(vals[0], vals[1]))
+    if len(vals) == 1:
+        return (vals[0], None)
+    return (None, None)
+
+def _first_bip_value(el, type_elem, bip_names):
+    for name in bip_names:
+        found = get_val_inst_or_type(el, type_elem, bip(name))
+        if found is not None:
+            return found
+    return None
+
+def strategy_equipment_box(el, type_elem):
+    """Оборудование/мебель/кейсворк/generic: x=min(план), y=max(план), z=высота.
+
+    Сначала built-in Width/Depth/Height; если пары плана нет — локальный bbox
+    (X/Y = план, Z = высота), затем мировой AABB. Нормализация min/max
+    схлопывает один типоразмер при разном повороте экземпляров.
+    """
+    result = {}
+
+    width = _first_bip_value(el, type_elem, EQUIPMENT_WIDTH_BIP_NAMES)
+    depth = _first_bip_value(el, type_elem, EQUIPMENT_DEPTH_BIP_NAMES)
+    height = _first_bip_value(el, type_elem, EQUIPMENT_HEIGHT_BIP_NAMES)
+
+    plan_a = width[0] if width is not None else None
+    plan_b = depth[0] if depth is not None else None
+    plan_src_parts = []
+    if width is not None:
+        plan_src_parts.append(width[1])
+    if depth is not None:
+        plan_src_parts.append(depth[1])
+
+    # Геометрия, если BIP не дали полную пару плана и/или высоту
+    need_plan = not (is_positive_number(plan_a) and is_positive_number(plan_b))
+    need_height = height is None
+    if need_plan or need_height:
+        dims = get_local_bbox_only(el)
+        src_geom = u"local bbox"
+        if dims is None:
+            dims = get_bbox_dimensions(el)
+            src_geom = u"world bbox"
+        if dims is not None:
+            if need_height and is_positive_number(dims.get("z")):
+                height = (dims["z"], u"{0} (height)".format(src_geom))
+            if need_plan:
+                # Не смешиваем один BIP с одной осью bbox — берём обе план-оси из геометрии
+                gx = dims.get("x") if is_positive_number(dims.get("x")) else None
+                gy = dims.get("y") if is_positive_number(dims.get("y")) else None
+                if gx is not None and gy is not None:
+                    plan_a, plan_b = gx, gy
+                    plan_src_parts = [u"{0} X".format(src_geom), u"{0} Y".format(src_geom)]
+
+    if height is not None:
+        result["z"] = height
+
+    width_n, depth_n = normalize_plan_width_depth(plan_a, plan_b)
+    if width_n is not None and depth_n is not None:
+        src_label = u"plan normalize min/max ({0})".format(u", ".join(plan_src_parts))
+        result["x"] = (width_n, src_label)
+        result["y"] = (depth_n, src_label)
+    elif width_n is not None:
+        src_label = plan_src_parts[0] if plan_src_parts else u"plan"
+        result["x"] = (width_n, src_label)
+
+    return result
+
+EQUIPMENT_BOX_CAT_KEYS = (
+    "MechanicalEquipment",
+    "ElectricalEquipment",
+    "PlumbingEquipment",
+    "SpecialityEquipment",
+    "MedicalEquipment",
+    "FoodServiceEquipment",
+    "Furniture",
+    "FurnitureSystems",
+    "Casework",
+    "GenericModel",
+    "PlumbingFixtures",
+    "LightingFixtures",
+)
+
 # ---------------------------------------------------------
 # 6. Таблицы диспетчеризации
 # ---------------------------------------------------------
@@ -1568,6 +1699,10 @@ if CAT["CurtainWallPanels"] is not None:
     STRATEGIES[CAT["CurtainWallPanels"]] = strategy_curtain_panel
 if CAT["CurtainWallMullions"] is not None:
     STRATEGIES[CAT["CurtainWallMullions"]] = strategy_curtain_mullion
+for _key in EQUIPMENT_BOX_CAT_KEYS:
+    _cid = CAT.get(_key)
+    if _cid is not None:
+        STRATEGIES[_cid] = strategy_equipment_box
 
 # Оси, которыми владеет категорийная стратегия: generic/bbox фолбэк для них ЗАПРЕЩЁН.
 STRATEGY_OWNED_AXES = {}
@@ -1599,6 +1734,11 @@ for _key, _axes in [
     _cid = CAT.get(_key)
     if _cid is not None:
         STRATEGY_OWNED_AXES[_cid] = _axes
+for _key in EQUIPMENT_BOX_CAT_KEYS:
+    _cid = CAT.get(_key)
+    if _cid is not None:
+        # x/y нормализуются стратегией (min/max плана); без generic BIP/bbox фолбэка
+        STRATEGY_OWNED_AXES[_cid] = set(["x", "y", "z"])
 
 # Оси, которые физически не имеют смысла — не пишутся вообще.
 UNSUPPORTED_AXES = {}
