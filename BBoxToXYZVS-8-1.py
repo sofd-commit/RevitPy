@@ -21,9 +21,11 @@
 # КАТЕГОРИЙНЫЕ СТРАТЕГИИ:
 #
 #   Doors, Windows (проёмы):
-#     x = FAMILY_WIDTH_PARAM, z = FAMILY_HEIGHT_PARAM,
-#     y = толщина (LookupParameter RU/EN + семейные синонимы).
+#     x = FAMILY_WIDTH_PARAM (Ширина), z = FAMILY_HEIGHT_PARAM (Высота),
+#     y = толщина: семейный параметр → толщина стены-хоста → (не bbox створки).
+#     l очищается (не max(bbox): иначе санация портит x/z).
 #     Оси x/y/z закреплены за стратегией — без generic/bbox фолбэка.
+#     ПИМ: y → ПИМ_Размер_Толщина; ПИМ_Размер_Глубина очищается.
 #
 #   DuctCurves, PipeCurves, CableTray, Conduit, FlexDuct, FlexPipe:
 #     Круглое: x = z = диаметр. Прямоугольное: x = ширина, z = высота.
@@ -779,18 +781,30 @@ CAT = {
 
 DOOR_THICKNESS_PARAM_NAMES = [
     u"Толщина",
+    u"Толщина полотна",
+    u"Толщина коробки",
+    u"Толщина рамы",
+    u"Глубина",
+    u"Глубина коробки",
+    u"Глубина рамы",
     u"Thickness",
     u"Door Thickness",
     u"Frame Thickness",
+    u"Frame Depth",
+    u"Depth",
 ]
 WINDOW_THICKNESS_PARAM_NAMES = [
     u"Толщина",
     u"Толщина коробки",
     u"Толщина рамы",
+    u"Глубина",
+    u"Глубина коробки",
+    u"Глубина рамы",
     u"Thickness",
     u"Frame Thickness",
     u"Window Thickness",
     u"Frame Depth",
+    u"Depth",
 ]
 
 SECTION_WIDTH_NAMES = [
@@ -802,6 +816,46 @@ SECTION_HEIGHT_NAMES = [
 SECTION_DEPTH_NAMES = [
     u"Глубина", u"Depth", u"b", u"B", u"t",
 ]
+
+def get_host_wall_thickness(el):
+    """Толщина стены-хоста для двери/окна (WALL_ATTR_WIDTH / CompoundStructure)."""
+    try:
+        host = el.Host
+    except:
+        host = None
+    if host is None:
+        return None
+    try:
+        if not isinstance(host, Wall):
+            return None
+    except:
+        return None
+
+    host_type = None
+    try:
+        tid = host.GetTypeId()
+        if tid and tid != ElementId.InvalidElementId:
+            host_type = doc.GetElement(tid)
+    except:
+        host_type = None
+
+    found = get_val_inst_or_type(host, host_type, bip("WALL_ATTR_WIDTH_PARAM"))
+    if found is not None:
+        return (found[0], u"хост-стена: {0}".format(found[1]))
+
+    if host_type is not None:
+        try:
+            cs = host_type.GetCompoundStructure()
+        except:
+            cs = None
+        if cs is not None:
+            try:
+                thickness = cs.GetWidth()
+                if is_positive_number(thickness):
+                    return (thickness, u"хост-стена: CompoundStructure")
+            except:
+                pass
+    return None
 
 def make_opening_strategy(thickness_names):
     def strategy(el, type_elem):
@@ -819,8 +873,11 @@ def make_opening_strategy(thickness_names):
         if h is not None:
             result["z"] = h
 
-        # Толщина проёма — осознанный поиск по списку имён (это и есть y для дверей/окон)
+        # Толщина проёма (y → ПИМ_Размер_Толщина): семейство → стена-хост.
+        # Геометрию створки/вложенных не используем — bbox двери часто = размах полотна.
         th = get_lookup_double(el, type_elem, thickness_names)
+        if th is None:
+            th = get_host_wall_thickness(el)
         if th is not None:
             result["y"] = th
         return result
@@ -2024,6 +2081,9 @@ for _key in ("Rooms", "MEPSpaces", "Areas"):
 # Оборудование / мебель / generic: только габарит x/y/z; l=max(bbox) ломал Глубину при повороте
 for _cid in EQUIPMENT_BOX_CAT_IDS:
     UNSUPPORTED_AXES[_cid] = set(["l"])
+# Двери/окна: l=max(bbox) совпадал с высотой/шириной → санация портила x/z
+for _cid in OPENING_CAT_IDS:
+    UNSUPPORTED_AXES[_cid] = set(["l"])
 
 # Категории, у которых l нельзя брать как max(bbox) — только curve/built-in.
 LENGTH_CURVE_ONLY = set()
@@ -2299,12 +2359,16 @@ try:
                     sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (ни built-in, ни curve, ни bbox)"
 
             # --- санация линейных элементов: x/y/z не должны копировать длину ---
-            # Оборудование/generic: l = Н/П, санация сечения балки не применяется
-            # (иначе при l≈max(план) сбрасывалась Глубина y и оси «плыли» от поворота).
+            # Оборудование/generic/проёмы: l очищается; санация сечения балки не применяется
+            # (иначе при l≈высоте/ширине сбрасывались оси и переписывались от поворота).
             length_for_check = values.get(LENGTH_AXIS)
             if length_for_check is None:
                 length_for_check = get_curve_length(el)
-            if length_for_check is not None and cat_id not in EQUIPMENT_BOX_CAT_IDS:
+            if (
+                length_for_check is not None
+                and cat_id not in EQUIPMENT_BOX_CAT_IDS
+                and cat_id not in OPENING_CAT_IDS
+            ):
                 polluted = [
                     a for a in LINEAR_AXES
                     if a in values and nearly_equal_len(values[a], length_for_check)
