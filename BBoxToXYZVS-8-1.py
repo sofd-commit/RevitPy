@@ -48,10 +48,11 @@
 #
 #   StructuralColumns / StructuralFraming:
 #     Колонны: z = высота, x/y = сечение типа (параметры/локальный bbox).
-#     Балки/каркас: l = длина по оси; x/z = сечение (параметры типа, иначе две
-#     меньшие стороны bbox с исключением оси длины). y = Н/П.
-#     Санация: если x или z ≈ l (типичный баг line-based семейств) — сечение
-#     пересчитывается из bbox заново.
+#     Балки/каркас: l = длина по оси;
+#       x = ширина сечения (STRUCTURAL_SECTION_COMMON_WIDTH / b / bbox.Y),
+#       z = высота сечения (STRUCTURAL_SECTION_COMMON_HEIGHT / h / bbox.Z),
+#       y = Н/П (параметр очищается).
+#     Bbox: ось длины исключается; не используется сортировка «две меньшие стороны».
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -1482,25 +1483,28 @@ try:
                 is_framing = (cat_id == CAT.get("StructuralFraming"))
                 if polluted or (is_framing and ("x" not in values or "z" not in values)):
                     bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
-                    if bw is not None and bh is not None:
-                        if is_framing or polluted:
-                            if "x" not in values or "x" in polluted or (
+                    if is_framing or polluted:
+                        if bw is not None and (
+                            "x" not in values or "x" in polluted or (
                                 "x" in values and not is_plausible_beam_section(values["x"], length_for_check)
-                            ):
-                                values["x"] = bw
-                                sources["x"] = u"санация: {0}".format(bsrc)
-                            if "z" not in values or "z" in polluted or (
+                            )
+                        ):
+                            values["x"] = bw
+                            sources["x"] = u"санация: {0}".format(bsrc)
+                        if bh is not None and (
+                            "z" not in values or "z" in polluted or (
                                 "z" in values and not is_plausible_beam_section(values["z"], length_for_check)
-                            ):
-                                values["z"] = bh
-                                sources["z"] = u"санация: {0}".format(bsrc)
-                            if "y" in polluted:
-                                values.pop("y", None)
-                                sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
-                            for axis in ("x", "z"):
-                                if axis in values and nearly_equal_len(values[axis], length_for_check):
-                                    values.pop(axis, None)
-                                    sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
+                            )
+                        ):
+                            values["z"] = bh
+                            sources["z"] = u"санация: {0}".format(bsrc)
+                        if "y" in polluted:
+                            values.pop("y", None)
+                            sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
+                        for axis in ("x", "z"):
+                            if axis in values and nearly_equal_len(values[axis], length_for_check):
+                                values.pop(axis, None)
+                                sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
 
             # --- шаг 2б: v/s по геометрии ---
             missing_scalar = [
