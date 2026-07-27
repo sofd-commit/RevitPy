@@ -1524,6 +1524,8 @@ summary = {
     "skipped_by_workset": len(skipped_by_workset),
     "skipped_unsupported_category": len(skipped_unsupported),
     "pim_unit_mode": PIM_UNIT_MODE,
+    "copy_to_pim": COPY_TO_PIM,
+    "first_errors": [e for e in errors[:5]],
 }
 
 OUT = (summary, results, errors, sources_log, skipped_by_workset, skipped_unsupported)
