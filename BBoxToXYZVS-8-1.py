@@ -2071,7 +2071,7 @@ def set_double_param(el, name, value_internal):
     return None
 
 def clear_double_param(el, name):
-    """Стирает числовой параметр (ставит 0) — для осей Н/П, чтобы убрать старые значения."""
+    """Стирает числовой параметр (ставит 0) — для неприменимых осей, чтобы убрать старые значения."""
     p = el.LookupParameter(name)
     if p is None:
         return "ЦЕЛЕВОЙ ПАРАМЕТР НЕ НАЙДЕН"
@@ -2380,7 +2380,7 @@ try:
                 values.pop("y", None)
                 sources["y"] = u"очищено (не применимо для категории)"
 
-            # --- запись: сначала полезные оси, потом очистка Н/П ---
+            # --- запись: сначала полезные оси, потом очистка неприменимых ---
             changed_any = False
             used_fallback = False
             write_errors = []
@@ -2406,7 +2406,7 @@ try:
                 row[axis] = values[axis]
                 changed_any = True
 
-            # Очистка осей Н/П (y для балок и т.п.) — после записи, ошибка очистки не откатывает размеры
+            # Очистка неприменимых осей — только стереть значение, без текста «Н/П»
             for axis in ALL_AXES:
                 if axis not in unsupported_axes:
                     continue
@@ -2416,12 +2416,8 @@ try:
                     clear_status = str(clear_ex)
                 if clear_status is None:
                     changed_any = True
-                if axis == "y":
-                    row[axis] = u"" if clear_status is None else clear_status
-                    src_row[axis] = u"очищено (не применимо для категории)"
-                else:
-                    row[axis] = "Н/П" if clear_status is None else clear_status
-                    src_row[axis] = "Н/П (не применимо для категории)"
+                row[axis] = u"" if clear_status is None else clear_status
+                src_row[axis] = u"очищено (не применимо для категории)"
                 if clear_status is not None:
                     write_errors.append(u"clear {0}: {1}".format(axis, clear_status))
 
@@ -2439,12 +2435,11 @@ try:
                 for axis in PIM_TEXT_MAP:
                     pim_name = get_pim_param_name(axis, cat_id)
                     if axis in unsupported_axes:
-                        text_clear = u"" if axis == "y" else u"Н/П"
                         try:
-                            status = set_text_param(el, pim_name, text_clear)
+                            status = set_text_param(el, pim_name, u"")
                         except Exception as pim_ex:
                             status = str(pim_ex)
-                        row[pim_name] = status if status is not None else text_clear
+                        row[pim_name] = status if status is not None else u""
                         if status is None:
                             changed_any = True
                         continue
