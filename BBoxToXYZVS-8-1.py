@@ -937,12 +937,6 @@ def get_beam_diameter_from_api(type_elem):
     d_bip = first_found([
         get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_DIAMETER")),
         get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_OUTER_DIAMETER")),
-        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_INNER_DIAMETER")),  # не используем как наружный
-    ])
-    # Только outer / common diameter, не inner
-    d_bip = first_found([
-        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_DIAMETER")),
-        get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_OUTER_DIAMETER")),
     ])
     if d_bip is not None and is_positive_number(d_bip[0]):
         return (d_bip[0], u"StructuralSection diameter: {0}".format(d_bip[1]))
