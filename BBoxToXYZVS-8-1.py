@@ -1640,7 +1640,8 @@ for _key in ("Rooms", "MEPSpaces", "Areas"):
 LENGTH_CURVE_ONLY = set()
 for _key in (
     "DuctCurves", "FlexDuctCurves", "PipeCurves", "FlexPipeCurves",
-    "CableTray", "Conduit", "Walls", "StructuralFraming", "CurtainWallMullions",
+    "CableTray", "Conduit", "Walls", "StructuralFraming", "StructuralColumns",
+    "CurtainWallMullions",
 ):
     _cid = CAT.get(_key)
     if _cid is not None:
@@ -1906,8 +1907,10 @@ try:
                     if a in values and nearly_equal_len(values[a], length_for_check)
                 ]
                 is_framing = (cat_id == CAT.get("StructuralFraming"))
+                is_column = (cat_id == CAT.get("StructuralColumns"))
+                is_struct_linear = is_framing or is_column
                 bad_section = False
-                if is_framing:
+                if is_struct_linear:
                     xv = values.get("x")
                     zv = values.get("z")
                     if xv is None or zv is None:
@@ -1917,7 +1920,7 @@ try:
                     elif not is_plausible_beam_section(zv, length_for_check, trusted=False, peer=xv):
                         bad_section = True
                 if polluted or bad_section:
-                    if is_framing:
+                    if is_struct_linear:
                         tw, th = resolve_framing_section(el, type_elem, length_for_check)
                         if tw is not None and ("x" not in values or "x" in polluted or bad_section):
                             values["x"] = tw[0]
@@ -1925,6 +1928,9 @@ try:
                         if th is not None and ("z" not in values or "z" in polluted or bad_section):
                             values["z"] = th[0]
                             sources["z"] = u"санация: {0}".format(th[1])
+                        values.pop("y", None)
+                        if "y" in unsupported_axes:
+                            sources["y"] = u"очищено (не применимо для категории)"
                     else:
                         bw, bh, bsrc = framing_section_perp_to_axis(el, length_for_check)
                         if bw is None and bh is None:
