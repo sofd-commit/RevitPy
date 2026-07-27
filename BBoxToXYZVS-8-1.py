@@ -811,7 +811,7 @@ def strategy_structural_column(el, type_elem):
     return result
 
 def nearly_equal_len(a, b, rel=0.02):
-    """Сравнение длин с допуском (~2%) — чтобы отсечь 'ширину' == длине балки."""
+    """Сравнение длин с допуском (~2%)."""
     try:
         if a is None or b is None:
             return False
@@ -823,24 +823,116 @@ def nearly_equal_len(a, b, rel=0.02):
     except:
         return False
 
-def is_plausible_beam_section(val, length_val):
-    """Сечение балки не должно совпадать с длиной и не должно быть ~длиной пролёта."""
+def is_plausible_beam_section(val, length_val, trusted=False, peer=None):
+    """Отсекает длину/пролёт, попавшие в сечение.
+    trusted=True — значение из Structural Section / явного b,h типа.
+    Без trusted: сечение не больше ~20% длины и не в разы больше второй стороны."""
     if not is_positive_number(val):
         return False
-    if length_val is None:
-        return True
-    if nearly_equal_len(val, length_val):
-        return False
     try:
-        if float(val) >= float(length_val) * 0.95:
-            return False
+        val = float(val)
     except:
         return False
+    if length_val is not None:
+        try:
+            lv = float(length_val)
+        except:
+            lv = None
+        if lv is not None and lv > 0:
+            if nearly_equal_len(val, lv):
+                return False
+            # 2260 при l=5880 (~38%) — это пролёт по Z, не сечение 120
+            limit = 0.95 if trusted else 0.20
+            if val >= lv * limit:
+                return False
+    if (not trusted) and peer is not None and is_positive_number(peer):
+        try:
+            peer = float(peer)
+            # Явно непропорционально (2260 vs 128) — отбрасываем большую сторону
+            if val > peer * 4.0 and val > peer + 1e-6:
+                return False
+        except:
+            pass
     return True
 
+def get_lookup_double_type_first(el, type_elem, names):
+    """Сначала ТИП, потом экземпляр — для сечения балки тип надёжнее."""
+    for pname in names:
+        for host in (type_elem, el):
+            if host is None:
+                continue
+            try:
+                p = host.LookupParameter(pname)
+            except:
+                p = None
+            if p is None or not p.HasValue:
+                continue
+            if p.StorageType != StorageType.Double:
+                continue
+            try:
+                value = p.AsDouble()
+            except:
+                continue
+            if is_positive_number(value):
+                where = u"тип" if host is type_elem else u"экземпляр"
+                return (value, u"{0}: {1}".format(where, pname))
+    return None
+
+def get_local_bbox_only(el):
+    """Только локальный bbox символа. БЕЗ фолбэка на мировой bbox
+    (мировой Z у балки/связи = пролёт по высоте, напр. 2260 вместо 120)."""
+    try:
+        geom = el.get_Geometry(_GEOM_OPTIONS)
+    except:
+        return None
+    if geom is None:
+        return None
+
+    min_pt = [None, None, None]
+    max_pt = [None, None, None]
+    found = [False]
+
+    def update(pt):
+        coords = (pt.X, pt.Y, pt.Z)
+        for i in range(3):
+            v = coords[i]
+            if min_pt[i] is None or v < min_pt[i]:
+                min_pt[i] = v
+            if max_pt[i] is None or v > max_pt[i]:
+                max_pt[i] = v
+        found[0] = True
+
+    def walk_local(gobj_list):
+        for gobj in gobj_list:
+            if isinstance(gobj, Solid):
+                if gobj.Volume and gobj.Volume > 0:
+                    for edge in gobj.Edges:
+                        try:
+                            curve = edge.AsCurve()
+                            pts = curve.Tessellate()
+                            for pt in pts:
+                                update(pt)
+                        except:
+                            continue
+            elif isinstance(gobj, GeometryInstance):
+                try:
+                    sym_geom = gobj.GetSymbolGeometry()
+                except:
+                    sym_geom = None
+                if sym_geom is not None:
+                    walk_local(sym_geom)
+
+    walk_local(geom)
+    if not found[0]:
+        return None
+    return {
+        "x": max_pt[0] - min_pt[0],
+        "y": max_pt[1] - min_pt[1],
+        "z": max_pt[2] - min_pt[2],
+    }
+
 def get_beam_section_from_structural_api(type_elem):
-    """Ширина/высота сечения из Structural Section API и common built-in параметров типа.
-    Возвращает (width, height, source) — любой из width/height может быть None."""
+    """Ширина/высота из Structural Section (trusted)."""
     if type_elem is None:
         return (None, None, None)
 
@@ -848,7 +940,6 @@ def get_beam_section_from_structural_api(type_elem):
     height = None
     src_parts = []
 
-    # 1) Built-in common section params (самый стабильный путь для балок Revit)
     w_bip = first_found([
         get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_COMMON_WIDTH")),
         get_builtin_value(type_elem, bip("STRUCTURAL_SECTION_WIDTH")),
@@ -870,7 +961,6 @@ def get_beam_section_from_structural_api(type_elem):
     if width is None and height is None and d_bip is not None:
         return (d_bip[0], d_bip[0], u"StructuralSection diameter: {0}".format(d_bip[1]))
 
-    # 2) GetStructuralSection().Width / .Height (если семейство поддерживает)
     if width is None or height is None:
         ss = None
         try:
@@ -913,22 +1003,39 @@ def get_beam_section_from_structural_api(type_elem):
         return (None, None, None)
     return (width, height, u"struct: {0}".format(u", ".join(src_parts)))
 
-# Имена параметров сечения балки (без двусмысленных вроде h1)
+# Строгие имена сечения. «Высота» только с типа (см. type-only ниже).
 BEAM_WIDTH_PARAM_NAMES = [
-    u"Ширина", u"Width", u"b", u"bf", u"B", u"b_фл", u"Ширина полки",
+    u"b", u"bf", u"B", u"b_фл", u"Ширина сечения", u"Ширина полки", u"Ширина",
 ]
 BEAM_HEIGHT_PARAM_NAMES = [
-    u"Высота", u"Height", u"h", u"H", u"ht", u"Высота сечения", u"d",
+    u"h", u"H", u"ht", u"Высота сечения", u"Высота профиля", u"Высота",
 ]
 
+def get_lookup_double_type_only(type_elem, names):
+    """Только параметр ТИПА — без экземпляра (у экземпляра «Высота» может быть пролётом)."""
+    if type_elem is None:
+        return None
+    for pname in names:
+        try:
+            p = type_elem.LookupParameter(pname)
+        except:
+            p = None
+        if p is None or not p.HasValue:
+            continue
+        if p.StorageType != StorageType.Double:
+            continue
+        try:
+            value = p.AsDouble()
+        except:
+            continue
+        if is_positive_number(value):
+            return (value, u"тип: {0}".format(pname))
+    return None
+
 def framing_section_from_bbox(el, length_val):
-    """Сечение балки из bbox: исключаем ось длины, затем
-    Y→ширина (x), Z→высота (z) — типичная СК семейства балки Revit.
-    Если длина в bbox не видна (короткий символьный солид) — две наибольшие стороны.
-    Возвращает (width, height, source)."""
-    dims = get_local_bbox_dimensions(el)
-    if dims is None:
-        dims = get_bbox_dimensions(el)
+    """Сечение ТОЛЬКО из локального bbox символа (без world AABB).
+    Исключаем ось длины; Y→ширина, Z→высота."""
+    dims = get_local_bbox_only(el)
     if dims is None:
         return (None, None, None)
 
@@ -942,64 +1049,56 @@ def framing_section_from_bbox(el, length_val):
             if nearly_equal_len(v, length_val) or v >= float(length_val) * 0.95:
                 length_key = k
                 break
-
-    # Если одна сторона явно длиннее двух других — это длина
     if length_key is None and len(items) == 3:
         ordered = sorted(items, key=lambda kv: kv[1])
         if ordered[2][1] > ordered[1][1] * 2.0:
             length_key = ordered[2][0]
 
     section_items = [(k, v) for k, v in items if k != length_key]
-
-    # Символ без длины вдоль оси: три размера профиля → берём две наибольшие (отбрасываем тонкую стенку)
     if len(section_items) < 2 and length_key is None and len(items) == 3:
-        section_items = sorted(items, key=lambda kv: kv[1])[1:]
-    elif length_key is None and len(items) == 3:
-        # длина не найдена, но и нет явного «длинного» ребра — две наибольшие
         max_dim = max(v for _, v in items)
-        if length_val is not None and max_dim < float(length_val) * 0.5:
+        if length_val is None or max_dim < float(length_val) * 0.5:
             section_items = sorted(items, key=lambda kv: kv[1])[1:]
 
     if len(section_items) < 2:
         return (None, None, None)
 
     smap = dict(section_items)
-    # Конвенция семейства балки Revit: после исключения длины
-    #   Y = ширина сечения → параметр x
-    #   Z = высота сечения → параметр z
     if "y" in smap and "z" in smap:
         width, height = smap["y"], smap["z"]
-        src = u"local bbox (Y→ширина/x, Z→высота/z)"
+        src = u"symbol bbox (Y→x, Z→z)"
     elif "x" in smap and "z" in smap:
         width, height = smap["x"], smap["z"]
-        src = u"local bbox (X→ширина/x, Z→высота/z)"
+        src = u"symbol bbox (X→x, Z→z)"
     elif "x" in smap and "y" in smap:
         width, height = smap["x"], smap["y"]
-        src = u"local bbox (X→ширина/x, Y→высота/z)"
+        src = u"symbol bbox (X→x, Y→z)"
     else:
         ordered_vals = sorted(v for _, v in section_items)
         width, height = ordered_vals[0], ordered_vals[-1]
-        src = u"local bbox (min→ширина, max→высота)"
+        src = u"symbol bbox (min/max)"
 
-    if not is_plausible_beam_section(width, length_val):
+    w_ok = is_plausible_beam_section(width, length_val, trusted=False, peer=height)
+    h_ok = is_plausible_beam_section(height, length_val, trusted=False, peer=width)
+    if not w_ok:
         width = None
-    if not is_plausible_beam_section(height, length_val):
+    if not h_ok:
         height = None
     if width is None and height is None:
         return (None, None, None)
     return (width, height, src)
 
 def strategy_structural_framing(el, type_elem):
-    """Балки/каркас:
-    l = длина по оси,
-    x = ширина сечения,
-    z = высота сечения,
+    """Балки/связи каркаса:
+    l = длина,
+    x = ширина сечения (напр. 120),
+    z = высота сечения (напр. 120),
     y = Н/П.
 
-    Порядок для x/z:
-      1) STRUCTURAL_SECTION_COMMON_WIDTH/HEIGHT + GetStructuralSection
-      2) параметры типа (Ширина/b, Высота/h)
-      3) bbox: ось длины исключается; Y→x, Z→z
+    Порядок (важно):
+      1) параметры ТИПА b / h / Ширина / Высота  ← ожидание пользователя 120×120
+      2) STRUCTURAL_SECTION_* / GetStructuralSection
+      3) только symbol bbox (НИКОГДА world AABB — оттуда был z=2260)
     """
     result = {}
 
@@ -1016,51 +1115,48 @@ def strategy_structural_framing(el, type_elem):
     if length is not None:
         result["l"] = length
 
-    # 1) Structural Section API / common BIP
-    sw, sh, ssrc = get_beam_section_from_structural_api(type_elem)
-    if sw is not None and is_plausible_beam_section(sw, length_val):
-        result["x"] = (sw, ssrc)
-    if sh is not None and is_plausible_beam_section(sh, length_val):
-        result["z"] = (sh, ssrc)
+    # 1) Параметры типа — главный источник номинального сечения 120×120
+    width = get_lookup_double_type_only(type_elem, BEAM_WIDTH_PARAM_NAMES)
+    height = get_lookup_double_type_only(type_elem, BEAM_HEIGHT_PARAM_NAMES)
+    if width is not None and is_plausible_beam_section(width[0], length_val, trusted=True):
+        result["x"] = width
+    if height is not None and is_plausible_beam_section(
+        height[0], length_val, trusted=True, peer=(result["x"][0] if "x" in result else None)
+    ):
+        result["z"] = height
 
-    # 2) Параметры типа/экземпляра
-    if "x" not in result:
-        width = first_found([
-            get_lookup_double(el, type_elem, BEAM_WIDTH_PARAM_NAMES),
-            get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM")),
-            get_val_inst_or_type(el, type_elem, bip("GENERIC_WIDTH")),
-        ])
-        if width is not None and is_plausible_beam_section(width[0], length_val):
-            result["x"] = width
+    # 2) Structural Section, если типа не хватило
+    if ("x" not in result) or ("z" not in result):
+        sw, sh, ssrc = get_beam_section_from_structural_api(type_elem)
+        if sw is not None and "x" not in result and is_plausible_beam_section(sw, length_val, trusted=True):
+            result["x"] = (sw, ssrc)
+        if sh is not None and "z" not in result and is_plausible_beam_section(
+            sh, length_val, trusted=True, peer=(result["x"][0] if "x" in result else None)
+        ):
+            result["z"] = (sh, ssrc)
 
-    if "z" not in result:
-        height = first_found([
-            get_lookup_double(el, type_elem, BEAM_HEIGHT_PARAM_NAMES),
-            get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
-            get_val_inst_or_type(el, type_elem, bip("GENERIC_HEIGHT")),
-        ])
-        if height is not None and is_plausible_beam_section(height[0], length_val):
-            result["z"] = height
-
-    # 3) Bbox с правильной привязкой осей (не «две меньшие по размеру»)
+    # 3) Symbol bbox only
     if ("x" not in result) or ("z" not in result):
         bw, bh, bsrc = framing_section_from_bbox(el, length_val)
         if bw is not None and "x" not in result:
-            result["x"] = (bw, bsrc)
+            if is_plausible_beam_section(bw, length_val, trusted=False, peer=(result["z"][0] if "z" in result else bh)):
+                result["x"] = (bw, bsrc)
         if bh is not None and "z" not in result:
-            result["z"] = (bh, bsrc)
+            if is_plausible_beam_section(bh, length_val, trusted=False, peer=(result["x"][0] if "x" in result else bw)):
+                result["z"] = (bh, bsrc)
 
-    # Финальная защита от длины в x/z
+    # Санация: выкинуть сторону, похожую на пролёт (2260 при ширине ~120)
+    if "x" in result and "z" in result:
+        xv, zv = result["x"][0], result["z"][0]
+        if not is_plausible_beam_section(zv, length_val, trusted=False, peer=xv):
+            result.pop("z", None)
+        elif not is_plausible_beam_section(xv, length_val, trusted=False, peer=zv):
+            result.pop("x", None)
+
     if length_val is not None:
         for axis in ("x", "z"):
-            if axis in result and not is_plausible_beam_section(result[axis][0], length_val):
+            if axis in result and nearly_equal_len(result[axis][0], length_val):
                 result.pop(axis, None)
-        if ("x" not in result) or ("z" not in result):
-            bw, bh, bsrc = framing_section_from_bbox(el, length_val)
-            if bw is not None and "x" not in result:
-                result["x"] = (bw, bsrc)
-            if bh is not None and "z" not in result:
-                result["z"] = (bh, bsrc)
 
     return result
 
