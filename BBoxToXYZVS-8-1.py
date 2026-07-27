@@ -523,6 +523,7 @@ SECTION_DEPTH_NAMES = [
 def make_opening_strategy(thickness_names):
     def strategy(el, type_elem):
         result = {}
+        # Сначала системные BIP проёма; имена семейства — только запасной путь
         w = get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM"))
         if w is None:
             w = get_lookup_double(el, type_elem, [u"Ширина", u"Width"])
@@ -535,6 +536,7 @@ def make_opening_strategy(thickness_names):
         if h is not None:
             result["z"] = h
 
+        # Толщина проёма — осознанный поиск по списку имён (это и есть y для дверей/окон)
         th = get_lookup_double(el, type_elem, thickness_names)
         if th is not None:
             result["y"] = th
@@ -799,8 +801,9 @@ def strategy_structural_column(el, type_elem):
         result["x"] = (diam[0], diam[1])
         result["y"] = (diam[0], diam[1])
         if "z" not in result:
-            # высота из bbox вдоль оси / уже выше
-            pass
+            dims = get_local_bbox_only(el)
+            if dims is not None and is_positive_number(dims.get("z")):
+                result["z"] = (dims["z"], u"symbol bbox Z")
         return result
 
     # 2) Геометрия ⊥ оси колонны
