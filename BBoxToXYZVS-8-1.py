@@ -65,7 +65,8 @@
 #     Стабильный типоразмер в плане (чтобы спецификация схлопывала один размер):
 #       x (Ширина)  = min(план.A, план.B),
 #       y (Глубина) = max(план.A, план.B),
-#       z (Высота)  = высота.
+#       z (Высота)  = высота,
+#       l = Н/П (не пишем max(bbox) в Длину — иначе санация сбрасывает y при повороте).
 #     Сначала Revit BIP Width/Depth/Height, иначе локальный bbox (X/Y план, Z высота),
 #     иначе мировой AABB. Поворот экземпляра в плане не должен менять x↔y.
 #
@@ -1839,9 +1840,10 @@ def _first_bip_value(el, type_elem, bip_names):
 def strategy_equipment_box(el, type_elem):
     """Оборудование/мебель/кейсворк/generic: x=min(план), y=max(план), z=высота.
 
-    Сначала built-in Width/Depth/Height; если пары плана нет — локальный bbox
+    Сначала built-in Width/Depth/Height; если пары плана нет — локальный/assembly bbox
     (X/Y = план, Z = высота), затем мировой AABB. Нормализация min/max
     схлопывает один типоразмер при разном повороте экземпляров.
+    Длина (l) этой стратегией не задаётся — для категории l = Н/П.
     """
     result = {}
 
@@ -1857,25 +1859,24 @@ def strategy_equipment_box(el, type_elem):
     if depth is not None:
         plan_src_parts.append(depth[1])
 
-    # Геометрия, если BIP не дали полную пару плана и/или высоту
+    # Геометрия всегда под рукой: и для недостающих осей, и как стабильный план при повороте
+    dims = get_local_bbox_only(el)
+    src_geom = u"local/assembly bbox"
+    if dims is None:
+        dims = get_bbox_dimensions(el)
+        src_geom = u"world bbox"
+
     need_plan = not (is_positive_number(plan_a) and is_positive_number(plan_b))
-    need_height = height is None
-    if need_plan or need_height:
-        dims = get_local_bbox_only(el)
-        src_geom = u"local bbox"
-        if dims is None:
-            dims = get_bbox_dimensions(el)
-            src_geom = u"world bbox"
-        if dims is not None:
-            if need_height and is_positive_number(dims.get("z")):
-                height = (dims["z"], u"{0} (height)".format(src_geom))
-            if need_plan:
-                # Не смешиваем один BIP с одной осью bbox — берём обе план-оси из геометрии
-                gx = dims.get("x") if is_positive_number(dims.get("x")) else None
-                gy = dims.get("y") if is_positive_number(dims.get("y")) else None
-                if gx is not None and gy is not None:
-                    plan_a, plan_b = gx, gy
-                    plan_src_parts = [u"{0} X".format(src_geom), u"{0} Y".format(src_geom)]
+    if height is None and dims is not None and is_positive_number(dims.get("z")):
+        height = (dims["z"], u"{0} (height)".format(src_geom))
+
+    if need_plan and dims is not None:
+        # Не смешиваем один BIP с одной осью bbox — берём обе план-оси из геометрии
+        gx = dims.get("x") if is_positive_number(dims.get("x")) else None
+        gy = dims.get("y") if is_positive_number(dims.get("y")) else None
+        if gx is not None and gy is not None:
+            plan_a, plan_b = gx, gy
+            plan_src_parts = [u"{0} X".format(src_geom), u"{0} Y".format(src_geom)]
 
     if height is not None:
         result["z"] = height
@@ -1992,6 +1993,12 @@ for _key in EQUIPMENT_BOX_CAT_KEYS:
         # x/y нормализуются стратегией (min/max плана); без generic BIP/bbox фолбэка
         STRATEGY_OWNED_AXES[_cid] = set(["x", "y", "z"])
 
+EQUIPMENT_BOX_CAT_IDS = set()
+for _key in EQUIPMENT_BOX_CAT_KEYS:
+    _cid = CAT.get(_key)
+    if _cid is not None:
+        EQUIPMENT_BOX_CAT_IDS.add(_cid)
+
 # Оси, которые физически не имеют смысла — не пишутся вообще.
 UNSUPPORTED_AXES = {}
 if CAT["Walls"] is not None:
@@ -2014,6 +2021,9 @@ for _key in ("Rooms", "MEPSpaces", "Areas"):
     _cid = CAT.get(_key)
     if _cid is not None:
         UNSUPPORTED_AXES[_cid] = set(["x", "y", "z"])
+# Оборудование / мебель / generic: только габарит x/y/z; l=max(bbox) ломал Глубину при повороте
+for _cid in EQUIPMENT_BOX_CAT_IDS:
+    UNSUPPORTED_AXES[_cid] = set(["l"])
 
 # Категории, у которых l нельзя брать как max(bbox) — только curve/built-in.
 LENGTH_CURVE_ONLY = set()
@@ -2289,10 +2299,12 @@ try:
                     sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (ни built-in, ни curve, ни bbox)"
 
             # --- санация линейных элементов: x/y/z не должны копировать длину ---
+            # Оборудование/generic: l = Н/П, санация сечения балки не применяется
+            # (иначе при l≈max(план) сбрасывалась Глубина y и оси «плыли» от поворота).
             length_for_check = values.get(LENGTH_AXIS)
             if length_for_check is None:
                 length_for_check = get_curve_length(el)
-            if length_for_check is not None:
+            if length_for_check is not None and cat_id not in EQUIPMENT_BOX_CAT_IDS:
                 polluted = [
                     a for a in LINEAR_AXES
                     if a in values and nearly_equal_len(values[a], length_for_check)
