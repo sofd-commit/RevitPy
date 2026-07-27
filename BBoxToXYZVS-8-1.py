@@ -1381,76 +1381,63 @@ def framing_section_from_bbox(el, length_val):
     return (width, height, src)
 
 def resolve_framing_section(el, type_elem, length_val):
-    """Сечение каркаса БЕЗ опоры на имена параметров семейства
-    (у разных семейств b/h/Ширина означают разное — вплоть до толщины стенки).
+    """Сечение каркаса БЕЗ Lookup по именам параметров семейства
+    (b/h/Ширина у разных семейств означают разное).
 
-    Порядок:
-      1) Structural Section API: Diameter (системный, не имя семейства)
-      2) Геометрия в плоскости ⊥ оси LocationCurve  ← основной метод
-      3) Symbol bbox (локальный, без world AABB)
-      4) Structural Section Width/Height API
-      5) Имена параметров типа — только крайний запасной путь
-      + если одна сторона << другой (4 vs 60) — обе = наружный габарит
+    Порядок (точные значения, без усреднения сторон):
+      1) Structural Section Diameter → x=z=D
+      2) Structural Section Width/Height (системный API Revit)
+      3) Геометрия ⊥ оси LocationCurve (две стороны как есть)
+      4) Symbol bbox
+      + если одна сторона << другой (толщина стенки vs габарит) — обе = наружный
     """
     width = None
     height = None
 
-    # 1) Диаметр из системного API Revit (не Lookup по имени семейства)
+    # 1) Диаметр (труба) — обе стороны равны диаметру осознанно
     diam = get_beam_diameter_from_api(type_elem)
     if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
         return ((diam[0], diam[1]), (diam[0], diam[1]))
 
-    # 2) Геометрия ⊥ оси — главный универсальный источник
-    bw, bh, bsrc = framing_section_perp_to_axis(el, length_val)
-    if bw is not None and is_plausible_beam_section(bw, length_val, trusted=True):
-        width = (bw, bsrc)
-    if bh is not None and is_plausible_beam_section(bh, length_val, trusted=True):
-        height = (bh, bsrc)
+    # 2) Width/Height из Structural Section API (каталожные точные размеры двутавра и т.п.)
+    api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
+    # get_beam_section_from_structural_api при наличии Diameter уже вернул бы D выше
+    # через get_beam_diameter; здесь Width/Height
+    if api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
+        # отсечь случай, когда API Width = толщина стенки при уже известном большом Height
+        width = (api_w, api_src)
+    if api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
+        height = (api_h, api_src)
     width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # 3) Symbol bbox
+    # Если API дал обе стороны сечения — используем их как точные (не усредняем)
+    if width is not None and height is not None:
+        return (width, height)
+
+    # 3) Геометрия ⊥ оси — без усреднения почти равных сторон (298 и 299 остаются разными)
+    if width is None or height is None:
+        bw, bh, bsrc = framing_section_perp_to_axis(el, length_val)
+        if width is None and bw is not None and is_plausible_beam_section(bw, length_val, trusted=True):
+            width = (bw, bsrc)
+        if height is None and bh is not None and is_plausible_beam_section(bh, length_val, trusted=True):
+            height = (bh, bsrc)
+        width, height = normalize_thickness_vs_outer(width, height, length_val)
+
+    # 4) Symbol bbox
     if width is None or height is None:
         sw, sh, ssrc = framing_section_from_bbox(el, length_val)
-        if width is None and sw is not None:
+        if width is None and sw is not None and is_plausible_beam_section(sw, length_val, trusted=True):
             width = (sw, ssrc)
-        if height is None and sh is not None:
+        if height is None and sh is not None and is_plausible_beam_section(sh, length_val, trusted=True):
             height = (sh, ssrc)
         width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # 4) Structural Section Width/Height (системный API; для труб Diameter уже выше)
-    if width is None or height is None:
-        api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
-        if width is None and api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
-            width = (api_w, api_src)
-        if height is None and api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
-            height = (api_h, api_src)
-        width, height = normalize_thickness_vs_outer(width, height, length_val)
-
-    # 5) Имена параметров — только если геометрия/API не дали сечения
-    if width is None or height is None:
-        pw = get_lookup_double_type_only(type_elem, BEAM_WIDTH_PARAM_NAMES_RECT)
-        ph = get_lookup_double_type_only(type_elem, BEAM_HEIGHT_PARAM_NAMES)
-        if width is None and pw is not None and is_plausible_beam_section(pw[0], length_val, trusted=True):
-            width = pw
-        if height is None and ph is not None and is_plausible_beam_section(ph[0], length_val, trusted=True):
-            height = ph
-        # не подставляем b=толщину, если вторая сторона уже есть как наружный размер
-        width, height = normalize_thickness_vs_outer(width, height, length_val)
-
-    # Круглое: стороны почти равны / одна отсутствует — выровнять
+    # Одна сторона найдена — копируем только если вторая совсем отсутствует
+    # (круг без Diameter API); НЕ усредняем две близкие стороны двутавра
     if width is not None and height is None:
         height = (width[0], u"x=z (одна сторона сечения)")
     elif height is not None and width is None:
         width = (height[0], u"x=z (одна сторона сечения)")
-    elif width is not None and height is not None:
-        try:
-            w, h = float(width[0]), float(height[0])
-            if nearly_equal_len(w, h, rel=0.08):
-                mid = 0.5 * (w + h)
-                width = (mid, width[1])
-                height = (mid, height[1])
-        except:
-            pass
 
     if width is not None and not is_plausible_beam_section(width[0], length_val, trusted=True):
         width = None
