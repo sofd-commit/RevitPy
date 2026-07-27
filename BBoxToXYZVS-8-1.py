@@ -48,10 +48,14 @@
 #
 #   StructuralColumns / StructuralFraming:
 #     Одна схема осей:
-#       l = длина вдоль оси (у колонны — высота),
+#       l = длина вдоль оси (у колонны — высота; у сборки вложенных — габарит сборки),
 #       x/z = сечение ⊥ оси: Structural Section API (точные Width/Height/Diameter),
 #       иначе геометрия без усреднения сторон; имена b/h семейства НЕ используются.
 #       y = Н/П — Глубина очищается.
+#     Вложенные семейства: при обходе symbol-геометрии учитывается Transform
+#     каждого GeometryInstance (иначе пластины «схлопываются» в размер одной детали).
+#     Если в символе есть вложенные instance — Structural Section API не приоритетен
+#     (часто это размер одной пластины, а не всей опоры/сборки).
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -343,56 +347,124 @@ def get_bbox_dimensions(el):
         return None
     return {"x": dx, "y": dy, "z": dz}
 
+def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
+    """Bbox по symbol-геометрии с учётом Transform вложенных GeometryInstance.
+
+    GetSymbolGeometry() каждого вложенного семейства даёт точки в ЕГО локальной СК.
+    Без умножения Transform все вложенные пластины «лежат» в начале координат →
+    габарит = размер одной детали (напр. 280 вместо сборки 2400).
+
+    apply_outer_instance_transform=False — остаёмся в СК символа хоста (для габарита типа).
+    """
+    if geom is None:
+        return None
+
+    min_pt = [None, None, None]
+    max_pt = [None, None, None]
+    found = [False]
+
+    def update(pt):
+        coords = (pt.X, pt.Y, pt.Z)
+        for i in range(3):
+            v = coords[i]
+            if min_pt[i] is None or v < min_pt[i]:
+                min_pt[i] = v
+            if max_pt[i] is None or v > max_pt[i]:
+                max_pt[i] = v
+        found[0] = True
+
+    def of_point(tr, pt):
+        if tr is None:
+            return pt
+        try:
+            return tr.OfPoint(pt)
+        except:
+            return pt
+
+    def walk(gobj_list, tr):
+        for gobj in gobj_list:
+            if isinstance(gobj, Solid):
+                if gobj.Volume and gobj.Volume > 0:
+                    for edge in gobj.Edges:
+                        try:
+                            for pt in edge.AsCurve().Tessellate():
+                                update(of_point(tr, pt))
+                        except:
+                            continue
+            elif isinstance(gobj, GeometryInstance):
+                try:
+                    child_tr = gobj.Transform
+                except:
+                    child_tr = None
+                try:
+                    sym_geom = gobj.GetSymbolGeometry()
+                except:
+                    sym_geom = None
+                if sym_geom is None:
+                    continue
+                # Внешний instance элемента: по умолчанию берём symbol без placement в модель.
+                # Вложенные instance внутри символа — Transform обязателен.
+                if tr is None and not apply_outer_instance_transform:
+                    walk(sym_geom, Transform.Identity)
+                else:
+                    if tr is None:
+                        combined = child_tr
+                    elif child_tr is None:
+                        combined = tr
+                    else:
+                        try:
+                            combined = tr.Multiply(child_tr)
+                        except:
+                            combined = child_tr
+                    walk(sym_geom, combined if combined is not None else Transform.Identity)
+
+    walk(geom, None)
+    if not found[0]:
+        return None
+    return {
+        "x": max_pt[0] - min_pt[0],
+        "y": max_pt[1] - min_pt[1],
+        "z": max_pt[2] - min_pt[2],
+    }
+
+def family_has_nested_geometry(el):
+    """True, если в symbol-геометрии есть вложенные GeometryInstance (сборка семейств)."""
+    try:
+        geom = el.get_Geometry(_GEOM_OPTIONS)
+    except:
+        return False
+    if geom is None:
+        return False
+    nested = [False]
+
+    def walk(glist, depth):
+        for gobj in glist:
+            if nested[0]:
+                return
+            if isinstance(gobj, GeometryInstance):
+                if depth >= 1:
+                    nested[0] = True
+                    return
+                try:
+                    sg = gobj.GetSymbolGeometry()
+                except:
+                    sg = None
+                if sg is not None:
+                    walk(sg, depth + 1)
+
+    walk(geom, 0)
+    return nested[0]
+
 def get_local_bbox_dimensions(el):
-    """Bbox в ЛОКАЛЬНОЙ системе координат типа (GetSymbolGeometry)."""
+    """Bbox в ЛОКАЛЬНОЙ системе координат типа (GetSymbolGeometry + Transform вложенных)."""
     try:
         geom = el.get_Geometry(_GEOM_OPTIONS)
     except:
         geom = None
 
-    if geom is not None:
-        min_pt = [None, None, None]
-        max_pt = [None, None, None]
-        found = [False]
-
-        def update(pt):
-            coords = (pt.X, pt.Y, pt.Z)
-            for i in range(3):
-                v = coords[i]
-                if min_pt[i] is None or v < min_pt[i]:
-                    min_pt[i] = v
-                if max_pt[i] is None or v > max_pt[i]:
-                    max_pt[i] = v
-            found[0] = True
-
-        def walk_local(gobj_list):
-            for gobj in gobj_list:
-                if isinstance(gobj, Solid):
-                    if gobj.Volume and gobj.Volume > 0:
-                        for edge in gobj.Edges:
-                            try:
-                                curve = edge.AsCurve()
-                                pts = curve.Tessellate()
-                                for pt in pts:
-                                    update(pt)
-                            except:
-                                continue
-                elif isinstance(gobj, GeometryInstance):
-                    try:
-                        sym_geom = gobj.GetSymbolGeometry()
-                    except:
-                        sym_geom = None
-                    if sym_geom is not None:
-                        walk_local(sym_geom)
-
-        walk_local(geom)
-
-        if found[0]:
-            dx = max_pt[0] - min_pt[0]
-            dy = max_pt[1] - min_pt[1]
-            dz = max_pt[2] - min_pt[2]
-            return {"x": dx, "y": dy, "z": dz}
-
+    dims = _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False)
+    if dims is not None:
+        return dims
     return get_bbox_dimensions(el)
 
 def get_curve_length(el):
@@ -810,14 +882,19 @@ def strategy_structural_column(el, type_elem):
             get_val_inst_or_type(el, type_elem, bip("INSTANCE_HEIGHT_PARAM")),
         ])
     if length is None:
-        # высота по символьному bbox вдоль оси Z семейства
-        dims = get_local_bbox_only(el)
-        if dims is not None:
-            items = sorted(
-                [float(dims[k]) for k in ("x", "y", "z") if is_positive_number(dims.get(k))]
-            )
-            if items:
-                length = (items[-1], u"symbol bbox (макс. сторона = высота)")
+        # высота по символьному bbox вдоль оси (с учётом вложенных семейств)
+        length = framing_overall_length_from_bbox(el)
+    elif family_has_nested_geometry(el):
+        bbox_len = framing_overall_length_from_bbox(el)
+        if bbox_len is not None and is_positive_number(length[0]) and is_positive_number(bbox_len[0]):
+            try:
+                if float(length[0]) < float(bbox_len[0]) * 0.5:
+                    length = (
+                        bbox_len[0],
+                        u"{0}; вместо малого BIP {1:g}".format(bbox_len[1], float(length[0])),
+                    )
+            except:
+                pass
     if length is not None and is_positive_number(length[0]):
         result["l"] = length
         length_val = length[0]
@@ -900,57 +977,26 @@ def get_lookup_double_type_first(el, type_elem, names):
     return None
 
 def get_local_bbox_only(el):
-    """Только локальный bbox символа. БЕЗ фолбэка на мировой bbox
+    """Только локальный bbox символа (с Transform вложенных). БЕЗ фолбэка на мировой bbox
     (мировой Z у балки/связи = пролёт по высоте, напр. 2260 вместо 120)."""
     try:
         geom = el.get_Geometry(_GEOM_OPTIONS)
     except:
         return None
-    if geom is None:
+    return _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False)
+
+def framing_overall_length_from_bbox(el):
+    """Максимальная сторона symbol-bbox (для опор/сборок без LocationCurve)."""
+    dims = get_local_bbox_only(el)
+    if dims is None:
         return None
-
-    min_pt = [None, None, None]
-    max_pt = [None, None, None]
-    found = [False]
-
-    def update(pt):
-        coords = (pt.X, pt.Y, pt.Z)
-        for i in range(3):
-            v = coords[i]
-            if min_pt[i] is None or v < min_pt[i]:
-                min_pt[i] = v
-            if max_pt[i] is None or v > max_pt[i]:
-                max_pt[i] = v
-        found[0] = True
-
-    def walk_local(gobj_list):
-        for gobj in gobj_list:
-            if isinstance(gobj, Solid):
-                if gobj.Volume and gobj.Volume > 0:
-                    for edge in gobj.Edges:
-                        try:
-                            curve = edge.AsCurve()
-                            pts = curve.Tessellate()
-                            for pt in pts:
-                                update(pt)
-                        except:
-                            continue
-            elif isinstance(gobj, GeometryInstance):
-                try:
-                    sym_geom = gobj.GetSymbolGeometry()
-                except:
-                    sym_geom = None
-                if sym_geom is not None:
-                    walk_local(sym_geom)
-
-    walk_local(geom)
-    if not found[0]:
+    items = [
+        float(dims[k]) for k in ("x", "y", "z")
+        if is_positive_number(dims.get(k))
+    ]
+    if not items:
         return None
-    return {
-        "x": max_pt[0] - min_pt[0],
-        "y": max_pt[1] - min_pt[1],
-        "z": max_pt[2] - min_pt[2],
-    }
+    return (max(items), u"symbol bbox (макс. сторона, вкл. вложенные)")
 
 def get_beam_diameter_from_api(type_elem):
     """Наружный диаметр трубы/круглого сечения (если есть)."""
@@ -1405,45 +1451,50 @@ def resolve_framing_section(el, type_elem, length_val):
     Порядок (точные значения, без усреднения сторон):
       1) Structural Section Diameter → x=z=D
       2) Structural Section Width/Height (системный API Revit)
+         — пропускается для сборок с вложенными семействами (часто размер пластины)
       3) Геометрия ⊥ оси LocationCurve (две стороны как есть)
-      4) Symbol bbox
+      4) Symbol bbox (с Transform вложенных)
       + если одна сторона << другой (толщина стенки vs габарит) — обе = наружный
     """
     width = None
     height = None
+    has_nested = family_has_nested_geometry(el)
 
     # 1) Диаметр (труба) — обе стороны равны диаметру осознанно
-    diam = get_beam_diameter_from_api(type_elem)
-    if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
-        return ((diam[0], diam[1]), (diam[0], diam[1]))
+    #    Для вложенных сборок Diameter тоже часто «от пластины» — пропускаем.
+    if not has_nested:
+        diam = get_beam_diameter_from_api(type_elem)
+        if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
+            return ((diam[0], diam[1]), (diam[0], diam[1]))
 
-    # 2) Width/Height из Structural Section API (каталожные точные размеры двутавра и т.п.)
-    api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
-    # get_beam_section_from_structural_api при наличии Diameter уже вернул бы D выше
-    # через get_beam_diameter; здесь Width/Height
-    if api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
-        # отсечь случай, когда API Width = толщина стенки при уже известном большом Height
-        width = (api_w, api_src)
-    if api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
-        height = (api_h, api_src)
-    width, height = normalize_thickness_vs_outer(width, height, length_val)
+        # 2) Width/Height из Structural Section API (каталожные точные размеры двутавра и т.п.)
+        api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
+        if api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
+            width = (api_w, api_src)
+        if api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
+            height = (api_h, api_src)
+        width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # Если API дал обе стороны сечения — используем их как точные (не усредняем)
-    if width is not None and height is not None:
-        return (width, height)
+        # Если API дал обе стороны сечения — используем их как точные (не усредняем)
+        if width is not None and height is not None:
+            return (width, height)
 
     # 3) Геометрия ⊥ оси — без усреднения почти равных сторон (298 и 299 остаются разными)
     if width is None or height is None:
         bw, bh, bsrc = framing_section_perp_to_axis(el, length_val)
+        if has_nested and bsrc:
+            bsrc = u"{0} (сборка вложенных)".format(bsrc)
         if width is None and bw is not None and is_plausible_beam_section(bw, length_val, trusted=True):
             width = (bw, bsrc)
         if height is None and bh is not None and is_plausible_beam_section(bh, length_val, trusted=True):
             height = (bh, bsrc)
         width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # 4) Symbol bbox
+    # 4) Symbol bbox (вложенные с их Transform)
     if width is None or height is None:
         sw, sh, ssrc = framing_section_from_bbox(el, length_val)
+        if has_nested and ssrc:
+            ssrc = u"{0} (сборка вложенных)".format(ssrc)
         if width is None and sw is not None and is_plausible_beam_section(sw, length_val, trusted=True):
             width = (sw, ssrc)
         if height is None and sh is not None and is_plausible_beam_section(sh, length_val, trusted=True):
@@ -1466,7 +1517,7 @@ def resolve_framing_section(el, type_elem, length_val):
 
 def strategy_structural_framing(el, type_elem):
     """Балки/связи каркаса:
-    l = длина по оси,
+    l = длина по оси (у сборки вложенных — габарит всей сборки),
     x = ширина сечения,
     z = высота сечения,
     y = Н/П.
@@ -1482,6 +1533,22 @@ def strategy_structural_framing(el, type_elem):
         curve_len = get_curve_length(el)
         if curve_len is not None:
             length = (curve_len, u"LocationCurve")
+
+    # Опора/сборка из вложенных: BIP/кривая часто = размер одной пластины (280),
+    # а реальный габарит — max стороны symbol-bbox (2400).
+    bbox_len = framing_overall_length_from_bbox(el)
+    if length is None:
+        length = bbox_len
+    elif bbox_len is not None and is_positive_number(length[0]) and is_positive_number(bbox_len[0]):
+        try:
+            if float(length[0]) < float(bbox_len[0]) * 0.5:
+                length = (
+                    bbox_len[0],
+                    u"{0}; вместо малого BIP/кривой {1:g}".format(bbox_len[1], float(length[0])),
+                )
+        except:
+            pass
+
     length_val = length[0] if length is not None else None
     if length is not None:
         result["l"] = length
