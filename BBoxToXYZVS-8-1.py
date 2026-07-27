@@ -1089,6 +1089,21 @@ def set_double_param(el, name, value_internal):
     p.Set(value_internal)
     return None
 
+def clear_double_param(el, name):
+    """Стирает числовой параметр (ставит 0) — для осей Н/П, чтобы убрать старые значения."""
+    p = el.LookupParameter(name)
+    if p is None:
+        return "ЦЕЛЕВОЙ ПАРАМЕТР НЕ НАЙДЕН"
+    if p.IsReadOnly:
+        return "ЦЕЛЕВОЙ ПАРАМЕТР ТОЛЬКО ДЛЯ ЧТЕНИЯ"
+    if p.StorageType != StorageType.Double:
+        return "ПАРАМЕТР НЕ ЧИСЛОВОЙ (StorageType != Double)"
+    try:
+        p.Set(0.0)
+    except Exception as e:
+        return str(e)
+    return None
+
 COPY_TO_PIM = bool(IN[2]) if len(IN) > 2 else False
 INCLUDE_UNITS = bool(IN[3]) if len(IN) > 3 else False
 
@@ -1344,12 +1359,27 @@ for el in elements:
                     sources[axis] = "НЕТ ДАННЫХ (ни built-in, ни геометрия)"
 
         # --- запись в параметры x/y/z/l/s/v ---
+        # Ось y для категорий, где она Н/П (балки, MEP и т.п.): принудительно
+        # вычищаем старые значения из параметра y, ничего туда не пишем.
+        if "y" in unsupported_axes:
+            values.pop("y", None)
+            sources["y"] = u"очищено (не применимо для категории)"
+
         changed_any = False
         used_fallback = False
         for axis in ALL_AXES:
             if axis in unsupported_axes and axis not in values:
-                row[axis] = "Н/П"
-                src_row[axis] = "Н/П (не применимо для категории)"
+                # Для y — стереть значение в модели (0) и оставить пустым в отчёте/ПИМ.
+                # Для прочих Н/П осей — тоже чистим, чтобы не оставался мусор прошлых прогонов.
+                clear_status = clear_double_param(el, axis)
+                if clear_status is None:
+                    changed_any = True
+                if axis == "y":
+                    row[axis] = u"" if clear_status is None else clear_status
+                    src_row[axis] = u"очищено (не применимо для категории)"
+                else:
+                    row[axis] = "Н/П" if clear_status is None else clear_status
+                    src_row[axis] = "Н/П (не применимо для категории)"
                 continue
             src = sources.get(axis, "—")
             src_row[axis] = src
@@ -1376,8 +1406,10 @@ for el in elements:
             for axis in PIM_TEXT_MAP:
                 pim_name = get_pim_param_name(axis, cat_id)
                 if axis in unsupported_axes and axis not in values:
-                    status = set_text_param(el, pim_name, u"Н/П")
-                    row[pim_name] = status if status is not None else u"Н/П"
+                    # y / ПИМ_Размер_Глубина — пустая строка; остальные Н/П-оси — "Н/П"
+                    text_clear = u"" if axis == "y" else u"Н/П"
+                    status = set_text_param(el, pim_name, text_clear)
+                    row[pim_name] = status if status is not None else text_clear
                     continue
                 if axis not in values:
                     row[pim_name] = "НЕТ ДАННЫХ"
