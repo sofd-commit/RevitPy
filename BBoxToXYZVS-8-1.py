@@ -52,10 +52,11 @@
 #       x/z = сечение ⊥ оси: Structural Section API (точные Width/Height/Diameter),
 #       иначе геометрия без усреднения сторон; имена b/h семейства НЕ используются.
 #       y = Н/П — Глубина очищается.
-#     Вложенные семейства: при обходе symbol-геометрии учитывается Transform
-#     каждого GeometryInstance (иначе пластины «схлопываются» в размер одной детали).
-#     Если в символе есть вложенные instance — Structural Section API не приоритетен
-#     (часто это размер одной пластины, а не всей опоры/сборки).
+#     Вложенные семейства:
+#       — non-shared: Transform GeometryInstance при обходе symbol-геометрии;
+#       — shared: НЕ входят в геометрию хоста → GetSubComponentIds() + объединение
+#         габаритов в локальной СК хоста (иначе размер одной пластины, напр. 280 вместо 2400).
+#       Structural Section API для сборок не приоритетен.
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -332,20 +333,200 @@ try:
 except:
     pass
 
-def get_bbox_dimensions(el):
-    """Мировой (axis-aligned) bbox — используется, если локальный недоступен."""
+# Для сборок со shared-вложенными: невидимая/вспомогательная геометрия тоже нужна
+_GEOM_OPTIONS_ASSEMBLY = Options()
+_GEOM_OPTIONS_ASSEMBLY.ComputeReferences = False
+_GEOM_OPTIONS_ASSEMBLY.IncludeNonVisibleObjects = True
+try:
+    _GEOM_OPTIONS_ASSEMBLY.DetailLevel = ViewDetailLevel.Fine
+except:
+    pass
+
+def iter_family_assembly_elements(el):
+    """Сам элемент + shared nested FamilyInstance через GetSubComponentIds (рекурсивно).
+
+    Shared-вложенные НЕ входят в GeometryInstance хоста — только как отдельные
+    элементы проекта, связанные через GetSubComponentIds().
+    """
+    out = []
+    seen = set()
+    stack = [el]
+    while stack:
+        cur = stack.pop()
+        if cur is None:
+            continue
+        try:
+            cid = cur.Id.IntegerValue
+        except:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cur)
+        try:
+            sub_ids = cur.GetSubComponentIds()
+        except:
+            sub_ids = None
+        if not sub_ids:
+            continue
+        try:
+            sub_list = list(sub_ids)
+        except:
+            sub_list = []
+            try:
+                for sid in sub_ids:
+                    sub_list.append(sid)
+            except:
+                sub_list = []
+        for sid in sub_list:
+            try:
+                sub = doc.GetElement(sid)
+            except:
+                sub = None
+            if sub is not None:
+                stack.append(sub)
+    return out
+
+def family_has_subcomponents(el):
+    """True, если у FamilyInstance есть shared nested (GetSubComponentIds)."""
     try:
-        bb = el.get_BoundingBox(None)
+        sub_ids = el.GetSubComponentIds()
     except:
-        bb = None
-    if bb is None:
+        return False
+    if not sub_ids:
+        return False
+    try:
+        return len(list(sub_ids)) > 0
+    except:
+        try:
+            return sub_ids.Count > 0
+        except:
+            return False
+
+def _bbox_minmax_to_dims(min_pt, max_pt):
+    if min_pt[0] is None:
         return None
-    dx = abs(bb.Max.X - bb.Min.X)
-    dy = abs(bb.Max.Y - bb.Min.Y)
-    dz = abs(bb.Max.Z - bb.Min.Z)
-    if not (is_positive_number(dx) or is_positive_number(dy) or is_positive_number(dz)):
+    return {
+        "x": max_pt[0] - min_pt[0],
+        "y": max_pt[1] - min_pt[1],
+        "z": max_pt[2] - min_pt[2],
+    }
+
+def _expand_minmax(min_pt, max_pt, found, pt):
+    coords = (pt.X, pt.Y, pt.Z)
+    for i in range(3):
+        v = coords[i]
+        if min_pt[i] is None or v < min_pt[i]:
+            min_pt[i] = v
+        if max_pt[i] is None or v > max_pt[i]:
+            max_pt[i] = v
+    found[0] = True
+
+def _walk_instance_solids(gobj_list, on_point):
+    """Обход GetInstanceGeometry: solids в мировой/instance СК."""
+    for gobj in gobj_list:
+        if isinstance(gobj, Solid):
+            if gobj.Volume and gobj.Volume > 0:
+                for edge in gobj.Edges:
+                    try:
+                        for pt in edge.AsCurve().Tessellate():
+                            on_point(pt)
+                    except:
+                        continue
+        elif isinstance(gobj, GeometryInstance):
+            try:
+                inst = gobj.GetInstanceGeometry()
+            except:
+                inst = None
+            if inst is not None:
+                _walk_instance_solids(inst, on_point)
+
+def _world_bb_corners(bb):
+    """8 углов мирового AABB."""
+    try:
+        x0, y0, z0 = bb.Min.X, bb.Min.Y, bb.Min.Z
+        x1, y1, z1 = bb.Max.X, bb.Max.Y, bb.Max.Z
+    except:
+        return []
+    corners = []
+    for x in (x0, x1):
+        for y in (y0, y1):
+            for z in (z0, z1):
+                corners.append(XYZ(x, y, z))
+    return corners
+
+def get_assembly_local_bbox(el):
+    """Габарит сборки в локальной СК хоста: хост + shared nested (GetSubComponentIds).
+
+    Точки берутся из GetInstanceGeometry (уже с placement), затем в локальную СК
+    через Inverse(GetTransform() хоста). Так учитываются и non-shared, и shared.
+    """
+    elements = iter_family_assembly_elements(el)
+    if not elements:
         return None
-    return {"x": dx, "y": dy, "z": dz}
+
+    inv = None
+    try:
+        inv = el.GetTransform().Inverse
+    except:
+        inv = None
+
+    min_pt = [None, None, None]
+    max_pt = [None, None, None]
+    found = [False]
+
+    def on_world_pt(pt):
+        if inv is not None:
+            try:
+                pt = inv.OfPoint(pt)
+            except:
+                pass
+        _expand_minmax(min_pt, max_pt, found, pt)
+
+    for e in elements:
+        geom = None
+        try:
+            geom = e.get_Geometry(_GEOM_OPTIONS_ASSEMBLY)
+        except:
+            geom = None
+        if geom is not None:
+            _walk_instance_solids(geom, on_world_pt)
+
+    # Запас: мировые AABB, если solids не прочитались (пустая геометрия / только shared без solids)
+    if not found[0]:
+        for e in elements:
+            try:
+                bb = e.get_BoundingBox(None)
+            except:
+                bb = None
+            if bb is not None:
+                for corner in _world_bb_corners(bb):
+                    on_world_pt(corner)
+
+    return _bbox_minmax_to_dims(min_pt, max_pt) if found[0] else None
+
+def get_bbox_dimensions(el):
+    """Мировой AABB хоста + shared nested (GetSubComponentIds)."""
+    min_pt = [None, None, None]
+    max_pt = [None, None, None]
+    found = [False]
+    for e in iter_family_assembly_elements(el):
+        try:
+            bb = e.get_BoundingBox(None)
+        except:
+            bb = None
+        if bb is None:
+            continue
+        for corner in _world_bb_corners(bb):
+            _expand_minmax(min_pt, max_pt, found, corner)
+    if not found[0]:
+        return None
+    dims = _bbox_minmax_to_dims(min_pt, max_pt)
+    if dims is None:
+        return None
+    if not (is_positive_number(dims["x"]) or is_positive_number(dims["y"]) or is_positive_number(dims["z"])):
+        return None
+    return dims
 
 def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
     """Bbox по symbol-геометрии с учётом Transform вложенных GeometryInstance.
@@ -355,6 +536,7 @@ def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
     габарит = размер одной детали (напр. 280 вместо сборки 2400).
 
     apply_outer_instance_transform=False — остаёмся в СК символа хоста (для габарита типа).
+    Shared-вложенные здесь НЕ видны — для них см. get_assembly_local_bbox.
     """
     if geom is None:
         return None
@@ -362,16 +544,6 @@ def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
     min_pt = [None, None, None]
     max_pt = [None, None, None]
     found = [False]
-
-    def update(pt):
-        coords = (pt.X, pt.Y, pt.Z)
-        for i in range(3):
-            v = coords[i]
-            if min_pt[i] is None or v < min_pt[i]:
-                min_pt[i] = v
-            if max_pt[i] is None or v > max_pt[i]:
-                max_pt[i] = v
-        found[0] = True
 
     def of_point(tr, pt):
         if tr is None:
@@ -388,7 +560,7 @@ def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
                     for edge in gobj.Edges:
                         try:
                             for pt in edge.AsCurve().Tessellate():
-                                update(of_point(tr, pt))
+                                _expand_minmax(min_pt, max_pt, found, of_point(tr, pt))
                         except:
                             continue
             elif isinstance(gobj, GeometryInstance):
@@ -419,18 +591,14 @@ def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
                     walk(sym_geom, combined if combined is not None else Transform.Identity)
 
     walk(geom, None)
-    if not found[0]:
-        return None
-    return {
-        "x": max_pt[0] - min_pt[0],
-        "y": max_pt[1] - min_pt[1],
-        "z": max_pt[2] - min_pt[2],
-    }
+    return _bbox_minmax_to_dims(min_pt, max_pt) if found[0] else None
 
 def family_has_nested_geometry(el):
-    """True, если в symbol-геометрии есть вложенные GeometryInstance (сборка семейств)."""
+    """True, если сборка: shared nested (GetSubComponentIds) или GeometryInstance в символе."""
+    if family_has_subcomponents(el):
+        return True
     try:
-        geom = el.get_Geometry(_GEOM_OPTIONS)
+        geom = el.get_Geometry(_GEOM_OPTIONS_ASSEMBLY)
     except:
         return False
     if geom is None:
@@ -456,16 +624,42 @@ def family_has_nested_geometry(el):
     return nested[0]
 
 def get_local_bbox_dimensions(el):
-    """Bbox в ЛОКАЛЬНОЙ системе координат типа (GetSymbolGeometry + Transform вложенных)."""
+    """Bbox в локальной СК хоста: сборка (shared+geometry) → symbol → world AABB."""
+    dims = get_assembly_local_bbox(el)
+    if dims is not None:
+        return dims
     try:
-        geom = el.get_Geometry(_GEOM_OPTIONS)
+        geom = el.get_Geometry(_GEOM_OPTIONS_ASSEMBLY)
     except:
         geom = None
-
     dims = _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False)
     if dims is not None:
         return dims
     return get_bbox_dimensions(el)
+
+def get_local_bbox_only(el):
+    """Локальный bbox сборки (хост + shared nested). БЕЗ фолбэка на мировой AABB одного хоста."""
+    dims = get_assembly_local_bbox(el)
+    if dims is not None:
+        return dims
+    try:
+        geom = el.get_Geometry(_GEOM_OPTIONS_ASSEMBLY)
+    except:
+        return None
+    return _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False)
+
+def framing_overall_length_from_bbox(el):
+    """Максимальная сторона symbol/assembly-bbox (для опор/сборок без LocationCurve)."""
+    dims = get_local_bbox_only(el)
+    if dims is None:
+        return None
+    items = [
+        float(dims[k]) for k in ("x", "y", "z")
+        if is_positive_number(dims.get(k))
+    ]
+    if not items:
+        return None
+    return (max(items), u"assembly bbox (макс. сторона, вкл. вложенные)")
 
 def get_curve_length(el):
     """Длина по LocationCurve (для дуг — длина дуги, не хорда)."""
@@ -976,28 +1170,6 @@ def get_lookup_double_type_first(el, type_elem, names):
                 return (value, u"{0}: {1}".format(where, pname))
     return None
 
-def get_local_bbox_only(el):
-    """Только локальный bbox символа (с Transform вложенных). БЕЗ фолбэка на мировой bbox
-    (мировой Z у балки/связи = пролёт по высоте, напр. 2260 вместо 120)."""
-    try:
-        geom = el.get_Geometry(_GEOM_OPTIONS)
-    except:
-        return None
-    return _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False)
-
-def framing_overall_length_from_bbox(el):
-    """Максимальная сторона symbol-bbox (для опор/сборок без LocationCurve)."""
-    dims = get_local_bbox_only(el)
-    if dims is None:
-        return None
-    items = [
-        float(dims[k]) for k in ("x", "y", "z")
-        if is_positive_number(dims.get(k))
-    ]
-    if not items:
-        return None
-    return (max(items), u"symbol bbox (макс. сторона, вкл. вложенные)")
-
 def get_beam_diameter_from_api(type_elem):
     """Наружный диаметр трубы/круглого сечения (если есть)."""
     if type_elem is None:
@@ -1262,7 +1434,9 @@ def _xyz_norm(v):
             return None
 
 def section_extents_perp_to_axis_vector(el, tangent, length_val, src_label):
-    """Два габарита сечения в плоскости, перпендикулярной tangent (из instance solids)."""
+    """Два габарита сечения в плоскости, перпендикулярной tangent (из instance solids).
+    Учитывает shared nested через GetSubComponentIds.
+    """
     tangent = _xyz_norm(tangent)
     if tangent is None:
         return (None, None, None)
@@ -1278,13 +1452,6 @@ def section_extents_perp_to_axis_vector(el, tangent, length_val, src_label):
         if upright is None:
             return (None, None, None)
     except:
-        return (None, None, None)
-
-    try:
-        geom = el.get_Geometry(_GEOM_OPTIONS)
-    except:
-        return (None, None, None)
-    if geom is None:
         return (None, None, None)
 
     min_l = [None]
@@ -1306,25 +1473,15 @@ def section_extents_perp_to_axis_vector(el, tangent, length_val, src_label):
             max_u[0] = uz
         found[0] = True
 
-    def walk(glist):
-        for gobj in glist:
-            if isinstance(gobj, Solid):
-                if gobj.Volume and gobj.Volume > 0:
-                    for edge in gobj.Edges:
-                        try:
-                            for pt in edge.AsCurve().Tessellate():
-                                accumulate(pt)
-                        except:
-                            continue
-            elif isinstance(gobj, GeometryInstance):
-                try:
-                    inst = gobj.GetInstanceGeometry()
-                except:
-                    inst = None
-                if inst is not None:
-                    walk(inst)
+    for e in iter_family_assembly_elements(el):
+        try:
+            geom = e.get_Geometry(_GEOM_OPTIONS_ASSEMBLY)
+        except:
+            geom = None
+        if geom is None:
+            continue
+        _walk_instance_solids(geom, accumulate)
 
-    walk(geom)
     if not found[0]:
         return (None, None, None)
 
