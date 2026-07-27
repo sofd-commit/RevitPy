@@ -49,10 +49,10 @@
 #   StructuralColumns / StructuralFraming:
 #     Колонны: z = высота, x/y = сечение типа (параметры/локальный bbox).
 #     Балки/каркас: l = длина по оси;
-#       x = ширина сечения (STRUCTURAL_SECTION_COMMON_WIDTH / b / bbox.Y),
-#       z = высота сечения (STRUCTURAL_SECTION_COMMON_HEIGHT / h / bbox.Z),
+#       x/z = сечение из параметров ТИПА (b/h/Ширина/Высота), затем Structural Section,
+#       затем только symbol bbox (world AABB запрещён — давал z=пролёт, напр. 2260).
 #       y = Н/П (параметр очищается).
-#     Bbox: ось длины исключается; не используется сортировка «две меньшие стороны».
+#       Сечение >20% длины или >> второй стороны отбрасывается.
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
