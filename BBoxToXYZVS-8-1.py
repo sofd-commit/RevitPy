@@ -47,16 +47,15 @@
 #     s/v/l из SpatialElement.Area/Volume/Perimeter. x/y/z = Н/П.
 #
 #   StructuralColumns / StructuralFraming:
-#     Одна схема осей:
-#       l = длина вдоль оси (у колонны — высота; у сборки вложенных — габарит сборки),
-#       x/z = сечение ⊥ оси: Structural Section API (точные Width/Height/Diameter),
-#       иначе геометрия без усреднения сторон; имена b/h семейства НЕ используются.
-#       y = Н/П — Глубина очищается.
-#     Вложенные семейства:
-#       — non-shared: Transform GeometryInstance при обходе symbol-геометрии;
-#       — shared: НЕ входят в геометрию хоста → GetSubComponentIds() + объединение
-#         габаритов в локальной СК хоста (иначе размер одной пластины, напр. 280 вместо 2400).
-#       Structural Section API для сборок не приоритетен.
+#     Обычные балки/колонны:
+#       l = длина вдоль оси,
+#       x/z = сечение ⊥ оси; y = Н/П.
+#     Сборки с вложенными семействами (опоры и т.п.):
+#       z = ПИМ_Размер_Высота (габарит сборки по высоте),
+#       x/y = план (min→Ширина, max→Глубина),
+#       l = Н/П (не пишем высоту в Длину).
+#     Вложенные: Transform non-shared + GetSubComponentIds() для shared.
+#     Structural Section API для сборок не приоритетен.
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -1055,14 +1054,69 @@ def strategy_spatial(el, type_elem):
 
 # --- 5g. Structural Columns / Framing ---
 
-def strategy_structural_column(el, type_elem):
-    """Несущие колонны — та же схема осей, что у балок:
-    l = длина/высота вдоль оси
-    x, z = сечение ⊥ оси (геометрия / Diameter API)
-    y = Н/П (Глубина очищается — не пишем толщину стенки и т.п.)
+def strategy_nested_structural_assembly(el, type_elem):
+    """Сборка вложенных (опора и т.п.): габариты как у «короба».
 
-    Имена параметров семейства (b/t/Глубина) не используются первыми.
+    z = Высота (локальный Z / макс. вертикаль сборки),
+    x = Ширина = min(план), y = Глубина = max(план),
+    l не заполняется (Н/П на уровне диспетчера).
     """
+    result = {}
+    dims = get_local_bbox_only(el)
+    if dims is None:
+        dims = get_local_bbox_dimensions(el)
+    if dims is None:
+        return result
+
+    hx = dims.get("x") if is_positive_number(dims.get("x")) else None
+    hy = dims.get("y") if is_positive_number(dims.get("y")) else None
+    hz = dims.get("z") if is_positive_number(dims.get("z")) else None
+
+    height = None
+    plan_a = None
+    plan_b = None
+    src = u"assembly bbox"
+
+    # Предпочитаем локальный Z как высоту (типичная ориентация семейства опоры)
+    if hz is not None:
+        height = hz
+        plan_a, plan_b = hx, hy
+        src_h = u"{0} Z → Высота".format(src)
+    else:
+        items = sorted(
+            [(k, float(dims[k])) for k in ("x", "y", "z") if is_positive_number(dims.get(k))],
+            key=lambda kv: kv[1],
+        )
+        if items:
+            height = items[-1][1]
+            src_h = u"{0} max → Высота".format(src)
+            rest = items[:-1]
+            if len(rest) >= 2:
+                plan_a, plan_b = rest[0][1], rest[1][1]
+            elif len(rest) == 1:
+                plan_a = rest[0][1]
+
+    if height is not None:
+        result["z"] = (height, src_h)
+
+    width_n, depth_n = normalize_plan_width_depth(plan_a, plan_b)
+    if width_n is not None and depth_n is not None:
+        result["x"] = (width_n, u"{0} plan min → Ширина".format(src))
+        result["y"] = (depth_n, u"{0} plan max → Глубина".format(src))
+    elif width_n is not None:
+        result["x"] = (width_n, u"{0} plan → Ширина".format(src))
+
+    return result
+
+def strategy_structural_column(el, type_elem):
+    """Несущие колонны.
+
+    Обычная колонна: l = высота вдоль оси, x/z = сечение, y = Н/П.
+    Сборка вложенных: z = Высота, x/y = план, l = Н/П.
+    """
+    if family_has_nested_geometry(el):
+        return strategy_nested_structural_assembly(el, type_elem)
+
     result = {}
 
     length_val = element_axis_length(el)
@@ -1076,24 +1130,11 @@ def strategy_structural_column(el, type_elem):
             get_val_inst_or_type(el, type_elem, bip("INSTANCE_HEIGHT_PARAM")),
         ])
     if length is None:
-        # высота по символьному bbox вдоль оси (с учётом вложенных семейств)
         length = framing_overall_length_from_bbox(el)
-    elif family_has_nested_geometry(el):
-        bbox_len = framing_overall_length_from_bbox(el)
-        if bbox_len is not None and is_positive_number(length[0]) and is_positive_number(bbox_len[0]):
-            try:
-                if float(length[0]) < float(bbox_len[0]) * 0.5:
-                    length = (
-                        bbox_len[0],
-                        u"{0}; вместо малого BIP {1:g}".format(bbox_len[1], float(length[0])),
-                    )
-            except:
-                pass
     if length is not None and is_positive_number(length[0]):
         result["l"] = length
         length_val = length[0]
 
-    # Сечение — тот же geometry-first путь, что у каркаса (x/z, не y)
     width, sect_h = resolve_framing_section(el, type_elem, length_val)
     if width is not None:
         result["x"] = width
@@ -1673,12 +1714,14 @@ def resolve_framing_section(el, type_elem, length_val):
     return (width, height)
 
 def strategy_structural_framing(el, type_elem):
-    """Балки/связи каркаса:
-    l = длина по оси (у сборки вложенных — габарит всей сборки),
-    x = ширина сечения,
-    z = высота сечения,
-    y = Н/П.
+    """Балки/связи каркаса.
+
+    Обычный элемент: l = длина по оси, x/z = сечение, y = Н/П.
+    Сборка вложенных (опора): z = Высота, x/y = план, l = Н/П.
     """
+    if family_has_nested_geometry(el):
+        return strategy_nested_structural_assembly(el, type_elem)
+
     result = {}
 
     length = first_found([
@@ -1690,21 +1733,6 @@ def strategy_structural_framing(el, type_elem):
         curve_len = get_curve_length(el)
         if curve_len is not None:
             length = (curve_len, u"LocationCurve")
-
-    # Опора/сборка из вложенных: BIP/кривая часто = размер одной пластины (280),
-    # а реальный габарит — max стороны symbol-bbox (2400).
-    bbox_len = framing_overall_length_from_bbox(el)
-    if length is None:
-        length = bbox_len
-    elif bbox_len is not None and is_positive_number(length[0]) and is_positive_number(bbox_len[0]):
-        try:
-            if float(length[0]) < float(bbox_len[0]) * 0.5:
-                length = (
-                    bbox_len[0],
-                    u"{0}; вместо малого BIP/кривой {1:g}".format(bbox_len[1], float(length[0])),
-                )
-        except:
-            pass
 
     length_val = length[0] if length is not None else None
     if length is not None:
@@ -2173,10 +2201,22 @@ try:
 
             values = {}
             sources = {}
-            unsupported_axes = UNSUPPORTED_AXES.get(cat_id, set())
-            owned_axes = STRATEGY_OWNED_AXES.get(cat_id, set())
+            unsupported_axes = set(UNSUPPORTED_AXES.get(cat_id, set()) or set())
+            owned_axes = set(STRATEGY_OWNED_AXES.get(cat_id, set()) or set())
             strategy_fn = STRATEGIES.get(cat_id)
             has_strategy = strategy_fn is not None
+
+            # Сборка вложенных в каркасе/колоннах: Высота→z, план→x/y, l=Н/П
+            is_nested_struct = False
+            if cat_id in (CAT.get("StructuralFraming"), CAT.get("StructuralColumns")):
+                try:
+                    is_nested_struct = family_has_nested_geometry(el)
+                except:
+                    is_nested_struct = False
+                if is_nested_struct:
+                    unsupported_axes.discard("y")
+                    unsupported_axes.add("l")
+                    owned_axes.update(["x", "y", "z", "l"])
 
             # --- шаг 0: категорийная стратегия ---
             if has_strategy:
@@ -2260,8 +2300,11 @@ try:
                 is_framing = (cat_id == CAT.get("StructuralFraming"))
                 is_column = (cat_id == CAT.get("StructuralColumns"))
                 is_struct_linear = is_framing or is_column
+                # Для сборок вложенных санация сечения балки не нужна (z = Высота сборки)
+                if is_nested_struct:
+                    polluted = [a for a in polluted if a != "z"]
                 bad_section = False
-                if is_struct_linear:
+                if is_struct_linear and not is_nested_struct:
                     xv = values.get("x")
                     zv = values.get("z")
                     if xv is None or zv is None:
@@ -2271,7 +2314,7 @@ try:
                     elif not is_plausible_beam_section(zv, length_for_check, trusted=False, peer=xv):
                         bad_section = True
                 if polluted or bad_section:
-                    if is_struct_linear:
+                    if is_struct_linear and not is_nested_struct:
                         tw, th = resolve_framing_section(el, type_elem, length_for_check)
                         if tw is not None and ("x" not in values or "x" in polluted or bad_section):
                             values["x"] = tw[0]
@@ -2282,7 +2325,7 @@ try:
                         values.pop("y", None)
                         if "y" in unsupported_axes:
                             sources["y"] = u"очищено (не применимо для категории)"
-                    else:
+                    elif not is_struct_linear:
                         bw, bh, bsrc = framing_section_perp_to_axis(el, length_for_check)
                         if bw is None and bh is None:
                             bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
@@ -2296,6 +2339,8 @@ try:
                         values.pop("y", None)
                         sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
                     for axis in ("x", "z"):
+                        if is_nested_struct and axis == "z":
+                            continue
                         if axis in values and nearly_equal_len(values[axis], length_for_check):
                             values.pop(axis, None)
                             sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
