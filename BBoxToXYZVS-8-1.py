@@ -48,7 +48,10 @@
 #
 #   StructuralColumns / StructuralFraming:
 #     Колонны: z = высота, x/y = сечение типа (параметры/локальный bbox).
-#     Балки/каркас: l = cut/instance/curve длина, x/z = сечение типа.
+#     Балки/каркас: l = длина по оси; x/z = сечение (параметры типа, иначе две
+#     меньшие стороны bbox с исключением оси длины). y = Н/П.
+#     Санация: если x или z ≈ l (типичный баг line-based семейств) — сечение
+#     пересчитывается из bbox заново.
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -766,7 +769,73 @@ def strategy_structural_column(el, type_elem):
                 result["z"] = (dims["z"], u"local bbox (column height)")
     return result
 
+def nearly_equal_len(a, b, rel=0.02):
+    """Сравнение длин с допуском (~2%) — чтобы отсечь 'ширину' == длине балки."""
+    try:
+        if a is None or b is None:
+            return False
+        a = float(a)
+        b = float(b)
+        if a <= 0 or b <= 0:
+            return False
+        return abs(a - b) <= rel * max(a, b)
+    except:
+        return False
+
+def is_plausible_beam_section(val, length_val):
+    """Сечение балки не должно совпадать с длиной и не должно быть ~длиной пролёта."""
+    if not is_positive_number(val):
+        return False
+    if length_val is None:
+        return True
+    if nearly_equal_len(val, length_val):
+        return False
+    # Запас на короткие балки: отсекаем только почти-длину (>= 95% l)
+    try:
+        if float(val) >= float(length_val) * 0.95:
+            return False
+    except:
+        return False
+    return True
+
+def framing_section_from_bbox(el, length_val):
+    """Две стороны сечения: исключаем ось, совпадающую с длиной; берём две меньшие.
+    Возвращает (width, height, source) или (None, None, None).
+    width <= height по величине (меньшая/большая сторона сечения)."""
+    dims = get_local_bbox_dimensions(el)
+    if dims is None:
+        dims = get_bbox_dimensions(el)
+    if dims is None:
+        return (None, None, None)
+
+    vals = [dims[k] for k in ("x", "y", "z") if is_positive_number(dims.get(k))]
+    if not vals:
+        return (None, None, None)
+
+    if length_val is not None:
+        filtered = [v for v in vals
+                    if not nearly_equal_len(v, length_val) and float(v) < float(length_val) * 0.95]
+        if len(filtered) >= 2:
+            vals = filtered
+        # если фильтр съел слишком много — откатываемся к двум минимальным из всех
+    vals = sorted(vals)
+    if len(vals) < 2:
+        return (None, None, None)
+
+    # Две меньшие стороны = сечение; наибольшая (если осталась) = длина вдоль оси
+    width = vals[0]
+    height = vals[1]
+    return (width, height, u"local bbox (сечение: две меньшие стороны, длина исключена)")
+
 def strategy_structural_framing(el, type_elem):
+    """Балки/каркас:
+    l = длина по оси,
+    x = ширина сечения,
+    z = высота сечения,
+    y = Н/П.
+
+    Важно: у line-based семейств локальный bbox.X часто = длина. Нельзя писать bbox.X в x.
+    """
     result = {}
 
     length = first_found([
@@ -778,10 +847,11 @@ def strategy_structural_framing(el, type_elem):
         curve_len = get_curve_length(el)
         if curve_len is not None:
             length = (curve_len, u"LocationCurve")
+    length_val = length[0] if length is not None else None
     if length is not None:
         result["l"] = length
 
-    # Сечение балки: ширина -> x, высота сечения -> z
+    # Кандидаты сечения из параметров — только если значение не похоже на длину
     width = first_found([
         get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM")),
         get_val_inst_or_type(el, type_elem, bip("GENERIC_WIDTH")),
@@ -792,22 +862,40 @@ def strategy_structural_framing(el, type_elem):
         get_val_inst_or_type(el, type_elem, bip("GENERIC_HEIGHT")),
         get_lookup_double(el, type_elem, SECTION_HEIGHT_NAMES),
     ])
-    if width is not None:
+    if width is not None and is_plausible_beam_section(width[0], length_val):
         result["x"] = width
-    if height is not None:
+    if height is not None and is_plausible_beam_section(height[0], length_val):
         result["z"] = height
 
-    if "x" not in result or "z" not in result:
-        dims = get_local_bbox_dimensions(el)
-        if dims is not None:
-            # У балок локальная ось длины обычно X или Y; сечение — две меньшие стороны.
-            vals = sorted([(k, dims[k]) for k in ("x", "y", "z") if is_positive_number(dims.get(k))],
-                          key=lambda kv: kv[1])
-            if len(vals) >= 2:
-                if "x" not in result:
-                    result["x"] = (vals[0][1], u"local bbox (framing section min)")
-                if "z" not in result:
-                    result["z"] = (vals[1][1], u"local bbox (framing section mid)")
+    # Фолбэк / санация: сечение из bbox (две меньшие стороны)
+    need_bbox = ("x" not in result) or ("z" not in result)
+    # Также если параметр всё же протащил длину в одну из осей
+    if "x" in result and length_val is not None and not is_plausible_beam_section(result["x"][0], length_val):
+        result.pop("x", None)
+        need_bbox = True
+    if "z" in result and length_val is not None and not is_plausible_beam_section(result["z"][0], length_val):
+        result.pop("z", None)
+        need_bbox = True
+
+    if need_bbox:
+        bw, bh, bsrc = framing_section_from_bbox(el, length_val)
+        if bw is not None and "x" not in result:
+            result["x"] = (bw, bsrc)
+        if bh is not None and "z" not in result:
+            result["z"] = (bh, bsrc)
+
+    # Финальная защита: x или z не должны равняться l
+    if length_val is not None:
+        for axis in ("x", "z"):
+            if axis in result and nearly_equal_len(result[axis][0], length_val):
+                result.pop(axis, None)
+        if ("x" not in result) or ("z" not in result):
+            bw, bh, bsrc = framing_section_from_bbox(el, length_val)
+            if bw is not None and "x" not in result:
+                result["x"] = (bw, bsrc)
+            if bh is not None and "z" not in result:
+                result["z"] = (bh, bsrc)
+
     return result
 
 # --- 5h. Curtain panels / mullions ---
@@ -1201,6 +1289,41 @@ for el in elements:
                     sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (bbox <= 0)"
             else:
                 sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (ни built-in, ни curve, ни bbox)"
+
+        # --- санация линейных элементов: x/y/z не должны копировать длину ---
+        length_for_check = values.get(LENGTH_AXIS)
+        if length_for_check is None:
+            length_for_check = get_curve_length(el)
+        if length_for_check is not None:
+            polluted = [
+                a for a in LINEAR_AXES
+                if a in values and nearly_equal_len(values[a], length_for_check)
+            ]
+            is_framing = (cat_id == CAT.get("StructuralFraming"))
+            if polluted or (is_framing and ("x" not in values or "z" not in values)):
+                bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
+                if bw is not None and bh is not None:
+                    if is_framing or polluted:
+                        # Для балки/линейного: сечение -> x (меньшая), z (большая); y не трогаем,
+                        # если категория пометила y как Н/П — она уже в unsupported.
+                        if "x" not in values or "x" in polluted or (
+                            "x" in values and not is_plausible_beam_section(values["x"], length_for_check)
+                        ):
+                            values["x"] = bw
+                            sources["x"] = u"санация: {0}".format(bsrc)
+                        if "z" not in values or "z" in polluted or (
+                            "z" in values and not is_plausible_beam_section(values["z"], length_for_check)
+                        ):
+                            values["z"] = bh
+                            sources["z"] = u"санация: {0}".format(bsrc)
+                        if "y" in polluted:
+                            values.pop("y", None)
+                            sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
+                        # Гарантируем, что длина не осталась в x/z
+                        for axis in ("x", "z"):
+                            if axis in values and nearly_equal_len(values[axis], length_for_check):
+                                values.pop(axis, None)
+                                sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
 
         # --- шаг 2б: v/s по геометрии ---
         missing_scalar = [
