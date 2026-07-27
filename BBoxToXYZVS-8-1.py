@@ -49,10 +49,9 @@
 #   StructuralColumns / StructuralFraming:
 #     Колонны: z = высота, x/y = сечение типа (параметры/локальный bbox).
 #     Балки/каркас: l = длина по оси;
-#       x/z = сечение из параметров ТИПА (b/h/Ширина/Высота), затем Structural Section,
-#       затем только symbol bbox (world AABB запрещён — давал z=пролёт, напр. 2260).
-#       y = Н/П (параметр очищается).
-#       Сечение >20% длины или >> второй стороны отбрасывается.
+#       x/z = сечение: параметры типа → Structural Section →
+#       геометрия в плоскости ⊥ оси LocationCurve (для наклонных) → symbol bbox.
+#       y = Н/П. World AABB для сечения не используется.
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -1735,30 +1734,42 @@ try:
                     if a in values and nearly_equal_len(values[a], length_for_check)
                 ]
                 is_framing = (cat_id == CAT.get("StructuralFraming"))
-                if polluted or (is_framing and ("x" not in values or "z" not in values)):
-                    bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
-                    if is_framing or polluted:
-                        if bw is not None and (
-                            "x" not in values or "x" in polluted or (
-                                "x" in values and not is_plausible_beam_section(values["x"], length_for_check)
-                            )
-                        ):
+                bad_section = False
+                if is_framing:
+                    xv = values.get("x")
+                    zv = values.get("z")
+                    if xv is None or zv is None:
+                        bad_section = True
+                    elif not is_plausible_beam_section(xv, length_for_check, trusted=False, peer=zv):
+                        bad_section = True
+                    elif not is_plausible_beam_section(zv, length_for_check, trusted=False, peer=xv):
+                        bad_section = True
+                if polluted or bad_section:
+                    if is_framing:
+                        tw, th = resolve_framing_section(el, type_elem, length_for_check)
+                        if tw is not None and ("x" not in values or "x" in polluted or bad_section):
+                            values["x"] = tw[0]
+                            sources["x"] = u"санация: {0}".format(tw[1])
+                        if th is not None and ("z" not in values or "z" in polluted or bad_section):
+                            values["z"] = th[0]
+                            sources["z"] = u"санация: {0}".format(th[1])
+                    else:
+                        bw, bh, bsrc = framing_section_perp_to_axis(el, length_for_check)
+                        if bw is None and bh is None:
+                            bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
+                        if bw is not None and ("x" not in values or "x" in polluted):
                             values["x"] = bw
                             sources["x"] = u"санация: {0}".format(bsrc)
-                        if bh is not None and (
-                            "z" not in values or "z" in polluted or (
-                                "z" in values and not is_plausible_beam_section(values["z"], length_for_check)
-                            )
-                        ):
+                        if bh is not None and ("z" not in values or "z" in polluted):
                             values["z"] = bh
                             sources["z"] = u"санация: {0}".format(bsrc)
-                        if "y" in polluted:
-                            values.pop("y", None)
-                            sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
-                        for axis in ("x", "z"):
-                            if axis in values and nearly_equal_len(values[axis], length_for_check):
-                                values.pop(axis, None)
-                                sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
+                    if "y" in polluted:
+                        values.pop("y", None)
+                        sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
+                    for axis in ("x", "z"):
+                        if axis in values and nearly_equal_len(values[axis], length_for_check):
+                            values.pop(axis, None)
+                            sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
 
             # --- шаг 2б: v/s по геометрии ---
             missing_scalar = [
