@@ -47,10 +47,10 @@
 #     s/v/l из SpatialElement.Area/Volume/Perimeter. x/y/z = Н/П.
 #
 #   StructuralColumns / StructuralFraming:
-#     Колонны: z = высота, x/y = сечение типа (параметры/локальный bbox).
+#     Колонны: z = длина оси; x/y = сечение ⊥ оси (геометрия / Diameter API).
+#       Имена b/t/Ширина НЕ используются первыми (часто = толщина стенки, напр. 6 мм).
 #     Балки/каркас: l = длина по оси;
-#       x/z = сечение ГЕОМЕТРИЕЙ ⊥ оси (не имена параметров семейства —
-#       у разных семейств b/Ширина могут значить толщину стенки и т.п.).
+#       x/z = сечение ГЕОМЕТРИЕЙ ⊥ оси (не имена параметров семейства).
 #       Дополнительно: Structural Section Diameter/API, symbol bbox.
 #       y = Н/П. World AABB не используется.
 #
@@ -771,43 +771,99 @@ def strategy_spatial(el, type_elem):
 # --- 5g. Structural Columns / Framing ---
 
 def strategy_structural_column(el, type_elem):
+    """Несущие колонны — без имён параметров семейства (b/t часто = толщина стенки).
+
+    z = высота/длина вдоль оси колонны
+    x, y = сечение ⊥ оси (геометрия / Structural Section Diameter)
+    """
     result = {}
 
-    h = first_found([
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
-        get_val_inst_or_type(el, type_elem, bip("INSTANCE_LENGTH_PARAM")),
-        get_val_inst_or_type(el, type_elem, bip("INSTANCE_HEIGHT_PARAM")),
-        get_lookup_double(el, type_elem, [u"Высота", u"Height", u"Unconnected Height"]),
-    ])
-    if h is not None:
+    length_val = element_axis_length(el)
+    # высота колонны
+    h = None
+    if length_val is not None:
+        h = (length_val, u"LocationCurve (длина оси)")
+    if h is None:
+        h = first_found([
+            get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
+            get_val_inst_or_type(el, type_elem, bip("INSTANCE_LENGTH_PARAM")),
+            get_val_inst_or_type(el, type_elem, bip("INSTANCE_HEIGHT_PARAM")),
+        ])
+    if h is not None and is_plausible_beam_section(h[0], None, trusted=True):
         result["z"] = h
+        length_val = h[0] if length_val is None else length_val
 
-    # Сечение: depth -> x, width -> y (локальные оси семейства колонны)
-    depth = first_found([
-        get_val_inst_or_type(el, type_elem, bip("GENERIC_DEPTH")),
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_DEPTH_PARAM")) if bip("FAMILY_DEPTH_PARAM") else None,
-        get_lookup_double(el, type_elem, SECTION_DEPTH_NAMES),
-    ])
-    width = first_found([
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM")),
-        get_val_inst_or_type(el, type_elem, bip("GENERIC_WIDTH")),
-        get_lookup_double(el, type_elem, SECTION_WIDTH_NAMES),
-    ])
-    if depth is not None:
-        result["x"] = depth
-    if width is not None:
-        result["y"] = width
+    # 1) Диаметр Structural Section
+    diam = get_beam_diameter_from_api(type_elem)
+    if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
+        result["x"] = (diam[0], diam[1])
+        result["y"] = (diam[0], diam[1])
+        if "z" not in result:
+            # высота из bbox вдоль оси / уже выше
+            pass
+        return result
 
-    # Если сечение не найдено в параметрах — локальный bbox (без подмены высоты, если она уже есть)
-    if "x" not in result or "y" not in result:
-        dims = get_local_bbox_dimensions(el)
+    # 2) Геометрия ⊥ оси колонны
+    axis = element_axis_vector(el)
+    a, b, src = section_extents_perp_to_axis_vector(
+        el, axis, length_val, u"геометрия ⊥ оси колонны"
+    )
+    width = (a, src) if a is not None else None
+    height = (b, src) if b is not None else None
+    width, height = normalize_thickness_vs_outer(width, height, length_val)
+
+    # 3) Symbol bbox (без world)
+    if width is None or height is None:
+        dims = get_local_bbox_only(el)
         if dims is not None:
-            if "x" not in result and is_positive_number(dims.get("x")):
-                result["x"] = (dims["x"], u"local bbox (column section)")
-            if "y" not in result and is_positive_number(dims.get("y")):
-                result["y"] = (dims["y"], u"local bbox (column section)")
-            if "z" not in result and is_positive_number(dims.get("z")):
-                result["z"] = (dims["z"], u"local bbox (column height)")
+            # две меньшие стороны — сечение, наибольшая — высота (если z ещё нет)
+            items = sorted(
+                [(k, float(dims[k])) for k in ("x", "y", "z") if is_positive_number(dims.get(k))],
+                key=lambda kv: kv[1]
+            )
+            if len(items) >= 2:
+                if width is None and is_plausible_beam_section(items[0][1], length_val, trusted=True):
+                    width = (items[0][1], u"symbol bbox (сечение)")
+                if height is None and is_plausible_beam_section(items[1][1], length_val, trusted=True):
+                    height = (items[1][1], u"symbol bbox (сечение)")
+            if "z" not in result and len(items) >= 3:
+                result["z"] = (items[2][1], u"symbol bbox (высота)")
+                length_val = items[2][1]
+        width, height = normalize_thickness_vs_outer(width, height, length_val)
+
+    # 4) Structural Section W/H API
+    if width is None or height is None:
+        api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
+        if width is None and api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
+            width = (api_w, api_src)
+        if height is None and api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
+            height = (api_h, api_src)
+        width, height = normalize_thickness_vs_outer(width, height, length_val)
+
+    # Круглое сечение
+    if width is not None and height is None:
+        height = (width[0], u"колонна: y=x")
+    elif height is not None and width is None:
+        width = (height[0], u"колонна: x=y")
+    elif width is not None and height is not None:
+        try:
+            if nearly_equal_len(width[0], height[0], rel=0.08):
+                mid = 0.5 * (float(width[0]) + float(height[0]))
+                width = (mid, width[1])
+                height = (mid, height[1])
+        except:
+            pass
+
+    if width is not None:
+        result["x"] = width
+    if height is not None:
+        result["y"] = height
+
+    if "z" not in result:
+        dims = get_local_bbox_only(el)
+        if dims is not None and is_positive_number(dims.get("z")):
+            result["z"] = (dims["z"], u"symbol bbox Z")
+
     return result
 
 def nearly_equal_len(a, b, rel=0.02):
@@ -1194,21 +1250,9 @@ def _xyz_norm(v):
         except:
             return None
 
-def framing_section_perp_to_axis(el, length_val):
-    """Сечение = габариты геометрии в плоскости ⊥ оси LocationCurve.
-    Корректно для горизонтальных, наклонных и вертикальных балок/связей.
-    x ← поперечная (lateral), z ← «вертикаль» сечения (upright)."""
-    try:
-        loc = el.Location
-    except:
-        return (None, None, None)
-    if not isinstance(loc, LocationCurve):
-        return (None, None, None)
-    try:
-        curve = loc.Curve
-        tangent = _xyz_norm(curve.ComputeDerivatives(0.5, True).BasisX)
-    except:
-        return (None, None, None)
+def section_extents_perp_to_axis_vector(el, tangent, length_val, src_label):
+    """Два габарита сечения в плоскости, перпендикулярной tangent (из instance solids)."""
+    tangent = _xyz_norm(tangent)
     if tangent is None:
         return (None, None, None)
 
@@ -1262,7 +1306,6 @@ def framing_section_perp_to_axis(el, length_val):
                         except:
                             continue
             elif isinstance(gobj, GeometryInstance):
-                # Геометрия экземпляра в координатах модели
                 try:
                     inst = gobj.GetInstanceGeometry()
                 except:
@@ -1274,17 +1317,68 @@ def framing_section_perp_to_axis(el, length_val):
     if not found[0]:
         return (None, None, None)
 
-    width = max_l[0] - min_l[0]
-    height = max_u[0] - min_u[0]
-    src = u"геометрия ⊥ оси кривой"
-
-    if not is_plausible_beam_section(width, length_val, trusted=False, peer=height):
-        width = None
-    if not is_plausible_beam_section(height, length_val, trusted=False, peer=width):
-        height = None
-    if width is None and height is None:
+    a = max_l[0] - min_l[0]
+    b = max_u[0] - min_u[0]
+    if not is_plausible_beam_section(a, length_val, trusted=True):
+        a = None
+    if not is_plausible_beam_section(b, length_val, trusted=True):
+        b = None
+    if a is None and b is None:
         return (None, None, None)
-    return (width, height, src)
+    return (a, b, src_label)
+
+def element_axis_vector(el):
+    """Ось линейного элемента: LocationCurve.tangent или BasisZ трансформации."""
+    try:
+        loc = el.Location
+    except:
+        loc = None
+    if isinstance(loc, LocationCurve):
+        try:
+            return _xyz_norm(loc.Curve.ComputeDerivatives(0.5, True).BasisX)
+        except:
+            pass
+    try:
+        return _xyz_norm(el.GetTransform().BasisZ)
+    except:
+        pass
+    return XYZ(0.0, 0.0, 1.0)
+
+def element_axis_length(el):
+    """Длина вдоль оси (кривая) или None."""
+    try:
+        loc = el.Location
+    except:
+        return None
+    if isinstance(loc, LocationCurve):
+        try:
+            length = loc.Curve.Length
+            if is_positive_number(length):
+                return length
+        except:
+            return None
+    return None
+
+def framing_section_perp_to_axis(el, length_val):
+    """Сечение балки/связи ⊥ LocationCurve (или оси трансформации)."""
+    try:
+        loc = el.Location
+    except:
+        loc = None
+    if isinstance(loc, LocationCurve):
+        try:
+            tangent = _xyz_norm(loc.Curve.ComputeDerivatives(0.5, True).BasisX)
+        except:
+            tangent = None
+        if tangent is None:
+            return (None, None, None)
+        return section_extents_perp_to_axis_vector(
+            el, tangent, length_val, u"геометрия ⊥ оси кривой"
+        )
+    axis = element_axis_vector(el)
+    return section_extents_perp_to_axis_vector(
+        el, axis, length_val, u"геометрия ⊥ оси трансформации"
+    )
 
 def framing_section_from_bbox(el, length_val):
     """Запасной путь: только symbol bbox (без world AABB)."""
@@ -1451,21 +1545,18 @@ def strategy_structural_framing(el, type_elem):
 # --- 5h. Curtain panels / mullions ---
 
 def strategy_curtain_panel(el, type_elem):
+    """Панели: Width/Height BIP, затем локальный bbox — без произвольных имён семейства."""
     result = {}
-    w = first_found([
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM")),
-        get_lookup_double(el, type_elem, [u"Ширина", u"Width"]),
-    ])
-    h = first_found([
-        get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
-        get_lookup_double(el, type_elem, [u"Высота", u"Height"]),
-    ])
+    w = get_val_inst_or_type(el, type_elem, bip("FAMILY_WIDTH_PARAM"))
+    h = get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM"))
     if w is not None:
         result["x"] = w
     if h is not None:
         result["z"] = h
     if "x" not in result or "z" not in result:
-        dims = get_local_bbox_dimensions(el)
+        dims = get_local_bbox_only(el)
+        if dims is None:
+            dims = get_local_bbox_dimensions(el)
         if dims is not None:
             if "x" not in result and is_positive_number(dims.get("x")):
                 result["x"] = (dims["x"], u"local bbox (panel)")
