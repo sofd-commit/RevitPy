@@ -74,6 +74,46 @@ from RevitServices.Transactions import TransactionManager
 
 doc = DocumentManager.Instance.CurrentDBDocument
 
+# Совместимость IronPython 2.7 / CPython 3 (Dynamo)
+try:
+    _STRING_TYPES = basestring  # noqa: F821 — IronPython / Py2
+except NameError:
+    _STRING_TYPES = (str,)
+
+def is_text(value):
+    return isinstance(value, _STRING_TYPES)
+
+def as_bool(value, default=False):
+    """Надёжное Да/Нет из портов Dynamo (bool / 0/1 / 'Да' / 'False')."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    try:
+        s = unicode(value).strip().lower()  # IronPython
+    except NameError:
+        s = str(value).strip().lower()
+    if s in (u"true", u"yes", u"да", u"1", u"y"):
+        return True
+    if s in (u"false", u"no", u"нет", u"0", u"n"):
+        return False
+    return default
+
+def source_is_fallback(src):
+    if not is_text(src):
+        try:
+            src = str(src)
+        except:
+            return False
+    if src in ("bbox", "geometry", "bbox (max)"):
+        return True
+    try:
+        return (u"local bbox" in src) or (u"санация" in src)
+    except:
+        return False
+
 # ---------------------------------------------------------
 # 1. Разворачиваем входные данные в плоский список элементов
 # ---------------------------------------------------------
@@ -1104,8 +1144,8 @@ def clear_double_param(el, name):
         return str(e)
     return None
 
-COPY_TO_PIM = bool(IN[2]) if len(IN) > 2 else False
-INCLUDE_UNITS = bool(IN[3]) if len(IN) > 3 else False
+COPY_TO_PIM = as_bool(IN[2], False) if len(IN) > 2 else False
+INCLUDE_UNITS = as_bool(IN[3], False) if len(IN) > 3 else False
 
 PIM_TEXT_MAP = {
     "x": u"ПИМ_Размер_Ширина",
@@ -1207,171 +1247,193 @@ sources_log = []
 skipped_unsupported = []
 
 TransactionManager.Instance.EnsureInTransaction(doc)
+try:
+    for el in elements:
+        row = {"Id": el.Id.IntegerValue}
+        src_row = {"Id": el.Id.IntegerValue}
+        try:
+            cat_id = get_cat_id(el)
 
-for el in elements:
-    row = {"Id": el.Id.IntegerValue}
-    src_row = {"Id": el.Id.IntegerValue}
-    try:
-        cat_id = get_cat_id(el)
+            if cat_id in UNSUPPORTED_CATEGORIES:
+                row["note"] = UNSUPPORTED_CATEGORIES[cat_id]
+                skipped_unsupported.append(row)
+                continue
 
-        if cat_id in UNSUPPORTED_CATEGORIES:
-            row["note"] = UNSUPPORTED_CATEGORIES[cat_id]
-            skipped_unsupported.append(row)
-            continue
+            type_id = el.GetTypeId()
+            type_elem = doc.GetElement(type_id) if type_id and type_id != ElementId.InvalidElementId else None
 
-        type_id = el.GetTypeId()
-        type_elem = doc.GetElement(type_id) if type_id and type_id != ElementId.InvalidElementId else None
+            # Curtain walls — составная система, не обычная стена
+            if cat_id == CAT.get("Walls") and is_curtain_wall(el, type_elem):
+                row["note"] = u"Curtain Wall не поддерживается как стена: обрабатывайте панели/импосты отдельно."
+                skipped_unsupported.append(row)
+                continue
 
-        # Curtain walls — составная система, не обычная стена
-        if cat_id == CAT.get("Walls") and is_curtain_wall(el, type_elem):
-            row["note"] = u"Curtain Wall не поддерживается как стена: обрабатывайте панели/импосты отдельно."
-            skipped_unsupported.append(row)
-            continue
+            values = {}
+            sources = {}
+            unsupported_axes = UNSUPPORTED_AXES.get(cat_id, set())
+            owned_axes = STRATEGY_OWNED_AXES.get(cat_id, set())
+            strategy_fn = STRATEGIES.get(cat_id)
+            has_strategy = strategy_fn is not None
 
-        values = {}
-        sources = {}
-        unsupported_axes = UNSUPPORTED_AXES.get(cat_id, set())
-        owned_axes = STRATEGY_OWNED_AXES.get(cat_id, set())
-        strategy_fn = STRATEGIES.get(cat_id)
-        has_strategy = strategy_fn is not None
+            # --- шаг 0: категорийная стратегия ---
+            if has_strategy:
+                for axis, found in strategy_fn(el, type_elem).items():
+                    if axis in unsupported_axes:
+                        continue
+                    value, src_name = found
+                    if not is_positive_number(value):
+                        continue
+                    values[axis] = value
+                    sources[axis] = u"категория: {0}".format(src_name)
 
-        # --- шаг 0: категорийная стратегия ---
-        if has_strategy:
-            for axis, found in strategy_fn(el, type_elem).items():
+            # --- шаг 1: общий built-in фолбэк ---
+            for axis in ALL_AXES:
+                if axis in values or axis in unsupported_axes:
+                    continue
+                if axis_blocked_by_strategy(axis, owned_axes, has_strategy):
+                    sources[axis] = u"НЕТ ДАННЫХ (ось категории без фолбэка)"
+                    continue
+                found = find_existing_geometry_value(el, type_elem, axis)
+                if found is not None:
+                    value, src_param_name = found
+                    values[axis] = value
+                    sources[axis] = u"built-in: {0}".format(src_param_name)
+
+            # --- шаг 2а: bbox / curve для незакреплённых осей ---
+            missing_linear = [
+                a for a in LINEAR_AXES
+                if a not in values
+                and a not in unsupported_axes
+                and not axis_blocked_by_strategy(a, owned_axes, has_strategy)
+            ]
+            missing_length_axis = (
+                LENGTH_AXIS not in values
+                and LENGTH_AXIS not in unsupported_axes
+                and not axis_blocked_by_strategy(LENGTH_AXIS, owned_axes, has_strategy)
+            )
+
+            bbox_dims = None
+            if missing_linear or (missing_length_axis and cat_id not in LENGTH_CURVE_ONLY):
+                bbox_dims = get_local_bbox_dimensions(el)
+
+            if missing_linear:
+                if bbox_dims is not None:
+                    for axis in missing_linear:
+                        if is_positive_number(bbox_dims.get(axis)):
+                            values[axis] = bbox_dims[axis]
+                            sources[axis] = "bbox"
+                        else:
+                            sources[axis] = "НЕТ ДАННЫХ (bbox <= 0)"
+                else:
+                    for axis in missing_linear:
+                        sources[axis] = "НЕТ ДАННЫХ (ни built-in, ни bbox)"
+
+            if missing_length_axis:
+                curve_len = get_curve_length(el)
+                if curve_len is not None:
+                    values[LENGTH_AXIS] = curve_len
+                    sources[LENGTH_AXIS] = "curve"
+                elif cat_id in LENGTH_CURVE_ONLY:
+                    sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (только curve/built-in длины, bbox запрещён)"
+                elif bbox_dims is not None:
+                    max_dim = max(bbox_dims.values())
+                    if is_positive_number(max_dim):
+                        values[LENGTH_AXIS] = max_dim
+                        sources[LENGTH_AXIS] = "bbox (max)"
+                    else:
+                        sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (bbox <= 0)"
+                else:
+                    sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (ни built-in, ни curve, ни bbox)"
+
+            # --- санация линейных элементов: x/y/z не должны копировать длину ---
+            length_for_check = values.get(LENGTH_AXIS)
+            if length_for_check is None:
+                length_for_check = get_curve_length(el)
+            if length_for_check is not None:
+                polluted = [
+                    a for a in LINEAR_AXES
+                    if a in values and nearly_equal_len(values[a], length_for_check)
+                ]
+                is_framing = (cat_id == CAT.get("StructuralFraming"))
+                if polluted or (is_framing and ("x" not in values or "z" not in values)):
+                    bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
+                    if bw is not None and bh is not None:
+                        if is_framing or polluted:
+                            if "x" not in values or "x" in polluted or (
+                                "x" in values and not is_plausible_beam_section(values["x"], length_for_check)
+                            ):
+                                values["x"] = bw
+                                sources["x"] = u"санация: {0}".format(bsrc)
+                            if "z" not in values or "z" in polluted or (
+                                "z" in values and not is_plausible_beam_section(values["z"], length_for_check)
+                            ):
+                                values["z"] = bh
+                                sources["z"] = u"санация: {0}".format(bsrc)
+                            if "y" in polluted:
+                                values.pop("y", None)
+                                sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
+                            for axis in ("x", "z"):
+                                if axis in values and nearly_equal_len(values[axis], length_for_check):
+                                    values.pop(axis, None)
+                                    sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
+
+            # --- шаг 2б: v/s по геометрии ---
+            missing_scalar = [
+                a for a in SCALAR_AXES
+                if a not in values
+                and a not in unsupported_axes
+                and not axis_blocked_by_strategy(a, owned_axes, has_strategy)
+            ]
+            if missing_scalar:
+                geom_volume, geom_area = get_geometry_volume_area(el)
+                geom_values = {"v": geom_volume, "s": geom_area}
+                for axis in missing_scalar:
+                    gv = geom_values[axis]
+                    if is_positive_number(gv):
+                        values[axis] = gv
+                        sources[axis] = "geometry"
+                    else:
+                        sources[axis] = "НЕТ ДАННЫХ (ни built-in, ни геометрия)"
+
+            # y для категорий Н/П никогда не пишем как размер
+            if "y" in unsupported_axes:
+                values.pop("y", None)
+                sources["y"] = u"очищено (не применимо для категории)"
+
+            # --- запись: сначала полезные оси, потом очистка Н/П ---
+            changed_any = False
+            used_fallback = False
+            write_errors = []
+
+            for axis in ALL_AXES:
                 if axis in unsupported_axes:
                     continue
-                value, src_name = found
-                if not is_positive_number(value):
+                src = sources.get(axis, "—")
+                src_row[axis] = src
+                if source_is_fallback(src):
+                    used_fallback = True
+                if axis not in values:
+                    row[axis] = "НЕТ ДАННЫХ"
                     continue
-                values[axis] = value
-                sources[axis] = u"категория: {0}".format(src_name)
+                try:
+                    status = set_double_param(el, axis, values[axis])
+                except Exception as write_ex:
+                    status = str(write_ex)
+                if status is not None:
+                    row[axis] = status
+                    write_errors.append(u"{0}: {1}".format(axis, status))
+                    continue
+                row[axis] = values[axis]
+                changed_any = True
 
-        # --- шаг 1: общий built-in фолбэк ---
-        for axis in ALL_AXES:
-            if axis in values or axis in unsupported_axes:
-                continue
-            if axis_blocked_by_strategy(axis, owned_axes, has_strategy):
-                sources[axis] = u"НЕТ ДАННЫХ (ось категории без фолбэка)"
-                continue
-            found = find_existing_geometry_value(el, type_elem, axis)
-            if found is not None:
-                value, src_param_name = found
-                values[axis] = value
-                sources[axis] = u"built-in: {0}".format(src_param_name)
-
-        # --- шаг 2а: bbox / curve для незакреплённых осей ---
-        missing_linear = [
-            a for a in LINEAR_AXES
-            if a not in values
-            and a not in unsupported_axes
-            and not axis_blocked_by_strategy(a, owned_axes, has_strategy)
-        ]
-        missing_length_axis = (
-            LENGTH_AXIS not in values
-            and LENGTH_AXIS not in unsupported_axes
-            and not axis_blocked_by_strategy(LENGTH_AXIS, owned_axes, has_strategy)
-        )
-
-        bbox_dims = None
-        if missing_linear or (missing_length_axis and cat_id not in LENGTH_CURVE_ONLY):
-            bbox_dims = get_local_bbox_dimensions(el)
-
-        if missing_linear:
-            if bbox_dims is not None:
-                for axis in missing_linear:
-                    if is_positive_number(bbox_dims.get(axis)):
-                        values[axis] = bbox_dims[axis]
-                        sources[axis] = "bbox"
-                    else:
-                        sources[axis] = "НЕТ ДАННЫХ (bbox <= 0)"
-            else:
-                for axis in missing_linear:
-                    sources[axis] = "НЕТ ДАННЫХ (ни built-in, ни bbox)"
-
-        if missing_length_axis:
-            curve_len = get_curve_length(el)
-            if curve_len is not None:
-                values[LENGTH_AXIS] = curve_len
-                sources[LENGTH_AXIS] = "curve"
-            elif cat_id in LENGTH_CURVE_ONLY:
-                sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (только curve/built-in длины, bbox запрещён)"
-            elif bbox_dims is not None:
-                max_dim = max(bbox_dims.values())
-                if is_positive_number(max_dim):
-                    values[LENGTH_AXIS] = max_dim
-                    sources[LENGTH_AXIS] = "bbox (max)"
-                else:
-                    sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (bbox <= 0)"
-            else:
-                sources[LENGTH_AXIS] = "НЕТ ДАННЫХ (ни built-in, ни curve, ни bbox)"
-
-        # --- санация линейных элементов: x/y/z не должны копировать длину ---
-        length_for_check = values.get(LENGTH_AXIS)
-        if length_for_check is None:
-            length_for_check = get_curve_length(el)
-        if length_for_check is not None:
-            polluted = [
-                a for a in LINEAR_AXES
-                if a in values and nearly_equal_len(values[a], length_for_check)
-            ]
-            is_framing = (cat_id == CAT.get("StructuralFraming"))
-            if polluted or (is_framing and ("x" not in values or "z" not in values)):
-                bw, bh, bsrc = framing_section_from_bbox(el, length_for_check)
-                if bw is not None and bh is not None:
-                    if is_framing or polluted:
-                        # Для балки/линейного: сечение -> x (меньшая), z (большая); y не трогаем,
-                        # если категория пометила y как Н/П — она уже в unsupported.
-                        if "x" not in values or "x" in polluted or (
-                            "x" in values and not is_plausible_beam_section(values["x"], length_for_check)
-                        ):
-                            values["x"] = bw
-                            sources["x"] = u"санация: {0}".format(bsrc)
-                        if "z" not in values or "z" in polluted or (
-                            "z" in values and not is_plausible_beam_section(values["z"], length_for_check)
-                        ):
-                            values["z"] = bh
-                            sources["z"] = u"санация: {0}".format(bsrc)
-                        if "y" in polluted:
-                            values.pop("y", None)
-                            sources["y"] = u"НЕТ ДАННЫХ (совпадало с длиной, сброшено)"
-                        # Гарантируем, что длина не осталась в x/z
-                        for axis in ("x", "z"):
-                            if axis in values and nearly_equal_len(values[axis], length_for_check):
-                                values.pop(axis, None)
-                                sources[axis] = u"НЕТ ДАННЫХ (совпадало с длиной)"
-
-        # --- шаг 2б: v/s по геометрии ---
-        missing_scalar = [
-            a for a in SCALAR_AXES
-            if a not in values
-            and a not in unsupported_axes
-            and not axis_blocked_by_strategy(a, owned_axes, has_strategy)
-        ]
-        if missing_scalar:
-            geom_volume, geom_area = get_geometry_volume_area(el)
-            geom_values = {"v": geom_volume, "s": geom_area}
-            for axis in missing_scalar:
-                gv = geom_values[axis]
-                if is_positive_number(gv):
-                    values[axis] = gv
-                    sources[axis] = "geometry"
-                else:
-                    sources[axis] = "НЕТ ДАННЫХ (ни built-in, ни геометрия)"
-
-        # --- запись в параметры x/y/z/l/s/v ---
-        # Ось y для категорий, где она Н/П (балки, MEP и т.п.): принудительно
-        # вычищаем старые значения из параметра y, ничего туда не пишем.
-        if "y" in unsupported_axes:
-            values.pop("y", None)
-            sources["y"] = u"очищено (не применимо для категории)"
-
-        changed_any = False
-        used_fallback = False
-        for axis in ALL_AXES:
-            if axis in unsupported_axes and axis not in values:
-                # Для y — стереть значение в модели (0) и оставить пустым в отчёте/ПИМ.
-                # Для прочих Н/П осей — тоже чистим, чтобы не оставался мусор прошлых прогонов.
-                clear_status = clear_double_param(el, axis)
+            # Очистка осей Н/П (y для балок и т.п.) — после записи, ошибка очистки не откатывает размеры
+            for axis in ALL_AXES:
+                if axis not in unsupported_axes:
+                    continue
+                try:
+                    clear_status = clear_double_param(el, axis)
+                except Exception as clear_ex:
+                    clear_status = str(clear_ex)
                 if clear_status is None:
                     changed_any = True
                 if axis == "y":
@@ -1380,64 +1442,76 @@ for el in elements:
                 else:
                     row[axis] = "Н/П" if clear_status is None else clear_status
                     src_row[axis] = "Н/П (не применимо для категории)"
-                continue
-            src = sources.get(axis, "—")
-            src_row[axis] = src
-            if src in ("bbox", "geometry", "bbox (max)") or (isinstance(src, basestring) and u"local bbox" in src):
-                used_fallback = True
-            if axis not in values:
-                row[axis] = "НЕТ ДАННЫХ"
-                continue
-            status = set_double_param(el, axis, values[axis])
-            if status is not None:
-                row[axis] = status
-                continue
-            row[axis] = values[axis]
-            changed_any = True
+                if clear_status is not None:
+                    write_errors.append(u"clear {0}: {1}".format(axis, clear_status))
 
-        flag_status = set_yesno_param(el, BBOX_FLAG_PARAM, used_fallback)
-        if flag_status is not None:
-            row[BBOX_FLAG_PARAM] = flag_status
-        else:
-            row[BBOX_FLAG_PARAM] = "yes" if used_fallback else "no"
+            try:
+                flag_status = set_yesno_param(el, BBOX_FLAG_PARAM, used_fallback)
+            except Exception as flag_ex:
+                flag_status = str(flag_ex)
+            if flag_status is not None:
+                row[BBOX_FLAG_PARAM] = flag_status
+            else:
+                row[BBOX_FLAG_PARAM] = "yes" if used_fallback else "no"
+                changed_any = True
 
-        # --- шаг 3: опциональное копирование в текстовые ПИМ_Размер_* ---
-        if COPY_TO_PIM:
-            for axis in PIM_TEXT_MAP:
-                pim_name = get_pim_param_name(axis, cat_id)
-                if axis in unsupported_axes and axis not in values:
-                    # y / ПИМ_Размер_Глубина — пустая строка; остальные Н/П-оси — "Н/П"
-                    text_clear = u"" if axis == "y" else u"Н/П"
-                    status = set_text_param(el, pim_name, text_clear)
-                    row[pim_name] = status if status is not None else text_clear
-                    continue
-                if axis not in values:
-                    row[pim_name] = "НЕТ ДАННЫХ"
-                    continue
-                text_value = format_value_as_text(axis, values[axis], INCLUDE_UNITS)
-                status = set_text_param(el, pim_name, text_value)
-                row[pim_name] = status if status is not None else text_value
+            if COPY_TO_PIM:
+                for axis in PIM_TEXT_MAP:
+                    pim_name = get_pim_param_name(axis, cat_id)
+                    if axis in unsupported_axes:
+                        text_clear = u"" if axis == "y" else u"Н/П"
+                        try:
+                            status = set_text_param(el, pim_name, text_clear)
+                        except Exception as pim_ex:
+                            status = str(pim_ex)
+                        row[pim_name] = status if status is not None else text_clear
+                        if status is None:
+                            changed_any = True
+                        continue
+                    if axis not in values:
+                        row[pim_name] = "НЕТ ДАННЫХ"
+                        continue
+                    text_value = format_value_as_text(axis, values[axis], INCLUDE_UNITS)
+                    try:
+                        status = set_text_param(el, pim_name, text_value)
+                    except Exception as pim_ex:
+                        status = str(pim_ex)
+                    row[pim_name] = status if status is not None else text_value
+                    if status is None:
+                        changed_any = True
 
-            if cat_id in OPENING_CAT_IDS:
-                legacy_name = PIM_TEXT_MAP["y"]  # ПИМ_Размер_Глубина
-                clear_status = set_text_param(el, legacy_name, u"")
-                row[legacy_name] = clear_status if clear_status is not None else u"очищено (не применимо для проёмов)"
+                if cat_id in OPENING_CAT_IDS:
+                    legacy_name = PIM_TEXT_MAP["y"]
+                    try:
+                        clear_status = set_text_param(el, legacy_name, u"")
+                    except Exception as pim_ex:
+                        clear_status = str(pim_ex)
+                    row[legacy_name] = clear_status if clear_status is not None else u"очищено (не применимо для проёмов)"
 
-        sources_log.append(src_row)
+            sources_log.append(src_row)
 
-        if changed_any:
-            if cat_id in QA_CAUTION_CATEGORIES:
-                row["note"] = u"ФИТИНГ: размеры из коннекторов/локального bbox; проверьте ориентацию при необходимости"
-            results.append(row)
-        else:
-            row["note"] = "Ни один параметр не записан"
+            if write_errors:
+                row["write_warnings"] = write_errors
+
+            if changed_any:
+                if cat_id in QA_CAUTION_CATEGORIES:
+                    row["note"] = u"ФИТИНГ: размеры из коннекторов/локального bbox; проверьте ориентацию при необходимости"
+                results.append(row)
+            else:
+                row["note"] = u"Ни один параметр не записан"
+                if write_errors:
+                    row["note"] = u"Ни один параметр не записан: " + u"; ".join(write_errors)
+                errors.append(row)
+
+        except Exception as e:
+            row["error"] = str(e)
             errors.append(row)
-
-    except Exception as e:
-        row["error"] = str(e)
-        errors.append(row)
-
-TransactionManager.Instance.TransactionTaskDone()
+finally:
+    try:
+        doc.Regenerate()
+    except:
+        pass
+    TransactionManager.Instance.TransactionTaskDone()
 
 # ---------------------------------------------------------
 # 9. Итог
