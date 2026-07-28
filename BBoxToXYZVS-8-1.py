@@ -49,15 +49,15 @@
 #     s/v/l из SpatialElement.Area/Volume/Perimeter. x/y/z = Н/П.
 #
 #   StructuralColumns / StructuralFraming:
-#     Обычные балки/колонны:
+#     Обычные балки/колонны/уголки/профили (в т.ч. с GeometryInstance внутри семейства):
 #       l = длина вдоль оси,
-#       x/z = сечение ⊥ оси; y = Н/П.
-#     Сборки с вложенными семействами (опоры и т.п.):
-#       z = ПИМ_Размер_Высота (габарит сборки по высоте),
-#       x/y = план (min→Ширина, max→Глубина),
-#       l = Н/П (не пишем высоту в Длину).
-#     Вложенные: Transform non-shared + GetSubComponentIds() для shared.
-#     Structural Section API для сборок не приоритетен.
+#       x/z = сечение ⊥ оси (Structural Section Width/Height/Diameter — всегда приоритет),
+#       y очищается.
+#     Сборка-короб только если есть shared nested (GetSubComponentIds), НЕТ профиля
+#     Structural Section и НЕТ LocationCurve (пример: опора ОП2 из пластин):
+#       z = Высота, x/y = план min/max, l очищается.
+#     Важно: вложенность GeometryInstance у уголка 75×75≠«сборка-короб» —
+#     иначе bbox даёт 200×75 / 75×200 вместо сечения профиля.
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -596,7 +596,12 @@ def _symbol_bbox_from_geometry(geom, apply_outer_instance_transform=False):
     return _bbox_minmax_to_dims(min_pt, max_pt) if found[0] else None
 
 def family_has_nested_geometry(el):
-    """True, если сборка: shared nested (GetSubComponentIds) или GeometryInstance в символе."""
+    """True, если shared nested (GetSubComponentIds) или GeometryInstance в символе.
+
+    Внимание: у прокатных профилей (уголок и т.п.) GeometryInstance внутри семейства
+    обычен — это НЕ признак «сборки-короба». Для маршрутизации стратегий
+    используйте is_structural_box_assembly().
+    """
     if family_has_subcomponents(el):
         return True
     try:
@@ -624,6 +629,36 @@ def family_has_nested_geometry(el):
 
     walk(geom, 0)
     return nested[0]
+
+def is_structural_box_assembly(el, type_elem):
+    """Сборка-короб (опора из shared-пластин), а не профиль (уголок/двутавр/труба).
+
+    Уголок 75×75×6 часто сам «вложенное» семейство с GeometryInstance — это всё ещё
+    линейный профиль: сечение из Structural Section, не габарит bbox 200×75.
+    """
+    if not family_has_subcomponents(el):
+        return False
+
+    # Есть каталожное сечение — это профиль, даже при shared nested
+    try:
+        api_w, api_h, _api_src = get_beam_section_from_structural_api(type_elem)
+    except:
+        api_w, api_h = None, None
+    if is_positive_number(api_w) and is_positive_number(api_h):
+        return False
+    try:
+        if get_beam_diameter_from_api(type_elem) is not None:
+            return False
+    except:
+        pass
+
+    # Линейный элемент с осью — считаем балку/связь (сечение ⊥ оси)
+    if element_axis_length(el) is not None:
+        return False
+    if get_curve_length(el) is not None:
+        return False
+
+    return True
 
 def get_local_bbox_dimensions(el):
     """Bbox в локальной СК хоста: сборка (shared+geometry) → symbol → world AABB."""
@@ -1169,10 +1204,10 @@ def strategy_nested_structural_assembly(el, type_elem):
 def strategy_structural_column(el, type_elem):
     """Несущие колонны.
 
-    Обычная колонна: l = высота вдоль оси, x/z = сечение, y = Н/П.
-    Сборка вложенных: z = Высота, x/y = план, l = Н/П.
+    Обычная колонна/профиль: l = высота вдоль оси, x/z = сечение, y очищается.
+    Сборка-короб (shared nested без профиля/кривой): z = Высота, x/y = план, l очищается.
     """
-    if family_has_nested_geometry(el):
+    if is_structural_box_assembly(el, type_elem):
         return strategy_nested_structural_assembly(el, type_elem)
 
     result = {}
@@ -1706,63 +1741,68 @@ def resolve_framing_section(el, type_elem, length_val):
 
     Порядок (точные значения, без усреднения сторон):
       1) Structural Section Diameter → x=z=D
-      2) Structural Section Width/Height (системный API Revit)
-         — пропускается для сборок с вложенными семействами (часто размер пластины)
-      3) Геометрия ⊥ оси LocationCurve (две стороны как есть)
-      4) Symbol bbox (с Transform вложенных)
+      2) Structural Section Width/Height (всегда, в т.ч. для уголка-«вложенного»)
+      3) Геометрия ⊥ оси LocationCurve
+      4) Symbol/assembly bbox
       + если одна сторона << другой (толщина стенки vs габарит) — обе = наружный
     """
     width = None
     height = None
-    has_nested = family_has_nested_geometry(el)
+    has_shared = family_has_subcomponents(el)
 
-    # 1) Диаметр (труба) — обе стороны равны диаметру осознанно
-    #    Для вложенных сборок Diameter тоже часто «от пластины» — пропускаем.
-    if not has_nested:
-        diam = get_beam_diameter_from_api(type_elem)
-        if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
-            return ((diam[0], diam[1]), (diam[0], diam[1]))
+    # 1) Диаметр (труба)
+    diam = get_beam_diameter_from_api(type_elem)
+    if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
+        return ((diam[0], diam[1]), (diam[0], diam[1]))
 
-        # 2) Width/Height из Structural Section API (каталожные точные размеры двутавра и т.п.)
-        api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
-        if api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
-            width = (api_w, api_src)
-        if api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
-            height = (api_h, api_src)
-        width, height = normalize_thickness_vs_outer(width, height, length_val)
+    # 2) Width/Height из Structural Section API (уголок 75×75, двутавр и т.п.)
+    api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
+    if api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
+        width = (api_w, api_src)
+    if api_h is not None and is_plausible_beam_section(api_h, length_val, trusted=True):
+        height = (api_h, api_src)
+    width, height = normalize_thickness_vs_outer(width, height, length_val)
+    if width is not None and height is not None:
+        return (width, height)
 
-        # Если API дал обе стороны сечения — используем их как точные (не усредняем)
-        if width is not None and height is not None:
-            return (width, height)
-
-    # 3) Геометрия ⊥ оси — без усреднения почти равных сторон (298 и 299 остаются разными)
+    # 3) Геометрия ⊥ оси
     if width is None or height is None:
         bw, bh, bsrc = framing_section_perp_to_axis(el, length_val)
-        if has_nested and bsrc:
-            bsrc = u"{0} (сборка вложенных)".format(bsrc)
+        if has_shared and bsrc:
+            bsrc = u"{0} (shared nested)".format(bsrc)
         if width is None and bw is not None and is_plausible_beam_section(bw, length_val, trusted=True):
             width = (bw, bsrc)
         if height is None and bh is not None and is_plausible_beam_section(bh, length_val, trusted=True):
             height = (bh, bsrc)
         width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # 4) Symbol bbox (вложенные с их Transform)
+    # 4) Symbol/assembly bbox
     if width is None or height is None:
         sw, sh, ssrc = framing_section_from_bbox(el, length_val)
-        if has_nested and ssrc:
-            ssrc = u"{0} (сборка вложенных)".format(ssrc)
+        if has_shared and ssrc:
+            ssrc = u"{0} (shared nested)".format(ssrc)
         if width is None and sw is not None and is_plausible_beam_section(sw, length_val, trusted=True):
             width = (sw, ssrc)
         if height is None and sh is not None and is_plausible_beam_section(sh, length_val, trusted=True):
             height = (sh, ssrc)
         width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # Одна сторона найдена — копируем только если вторая совсем отсутствует
-    # (круг без Diameter API); НЕ усредняем две близкие стороны двутавра
     if width is not None and height is None:
         height = (width[0], u"x=z (одна сторона сечения)")
     elif height is not None and width is None:
         width = (height[0], u"x=z (одна сторона сечения)")
+
+    # Стабильный порядок сторон сечения при повороте экземпляра (75×200 vs 200×75)
+    if width is not None and height is not None:
+        try:
+            wv, hv = float(width[0]), float(height[0])
+            if wv > hv:
+                width, height = (
+                    (hv, u"section min ({0})".format(height[1])),
+                    (wv, u"section max ({0})".format(width[1])),
+                )
+        except:
+            pass
 
     if width is not None and not is_plausible_beam_section(width[0], length_val, trusted=True):
         width = None
@@ -1772,12 +1812,12 @@ def resolve_framing_section(el, type_elem, length_val):
     return (width, height)
 
 def strategy_structural_framing(el, type_elem):
-    """Балки/связи каркаса.
+    """Балки/связи/уголки каркаса.
 
-    Обычный элемент: l = длина по оси, x/z = сечение, y = Н/П.
-    Сборка вложенных (опора): z = Высота, x/y = план, l = Н/П.
+    Обычный профиль: l = длина по оси, x/z = сечение, y очищается.
+    Сборка-короб (shared nested без профиля/кривой): z = Высота, x/y = план, l очищается.
     """
-    if family_has_nested_geometry(el):
+    if is_structural_box_assembly(el, type_elem):
         return strategy_nested_structural_assembly(el, type_elem)
 
     result = {}
@@ -2276,11 +2316,12 @@ try:
             strategy_fn = STRATEGIES.get(cat_id)
             has_strategy = strategy_fn is not None
 
-            # Сборка вложенных в каркасе/колоннах: Высота→z, план→x/y, l=Н/П
+            # Сборка-короб в каркасе/колоннах: Высота→z, план→x/y, l очищается
+            # (уголок/профиль с GeometryInstance сюда НЕ попадает)
             is_nested_struct = False
             if cat_id in (CAT.get("StructuralFraming"), CAT.get("StructuralColumns")):
                 try:
-                    is_nested_struct = family_has_nested_geometry(el)
+                    is_nested_struct = is_structural_box_assembly(el, type_elem)
                 except:
                     is_nested_struct = False
                 if is_nested_struct:
