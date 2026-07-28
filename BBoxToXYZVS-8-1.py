@@ -49,15 +49,14 @@
 #     s/v/l из SpatialElement.Area/Volume/Perimeter. x/y/z = Н/П.
 #
 #   StructuralColumns / StructuralFraming:
-#     Обычные балки/колонны/уголки/профили (в т.ч. с GeometryInstance внутри семейства):
-#       l = длина вдоль оси,
-#       x/z = сечение ⊥ оси (Structural Section Width/Height/Diameter — всегда приоритет),
-#       y очищается.
-#     Сборка-короб только если есть shared nested (GetSubComponentIds), НЕТ профиля
-#     Structural Section и НЕТ LocationCurve (пример: опора ОП2 из пластин):
-#       z = Высота, x/y = план min/max, l очищается.
-#     Важно: вложенность GeometryInstance у уголка 75×75≠«сборка-короб» —
-#     иначе bbox даёт 200×75 / 75×200 вместо сечения профиля.
+#     Shared-сборка (у хоста есть GetSubComponentIds):
+#       — на ХОСТЕ пишется габарит всей сборки (короб или l + сечение сборки ⊥ оси);
+#       — на каждой SHARED-детали (отдельный элемент проекта) — свой типоразмер
+#         (уголок 75×75 из Structural Section и т.п.).
+#       Входной список элементов дополняется subcomponents автоматически.
+#     Обычный профиль без shared-детей:
+#       l = длина вдоль оси, x/z = сечение (Structural Section → геометрия), y очищается.
+#     GeometryInstance внутри семейства ≠ shared-сборка (уголок не должен стать «коробом»).
 #
 #   CurtainWallPanels / CurtainWallMullions:
 #     Панели: x/z как ширина/высота семейства; импосты: l по кривой/длине.
@@ -630,35 +629,48 @@ def family_has_nested_geometry(el):
     walk(geom, 0)
     return nested[0]
 
+def is_assembly_host(el):
+    """Хост shared-сборки: есть GetSubComponentIds (общие вложенные в проекте)."""
+    return family_has_subcomponents(el)
+
+def is_shared_subcomponent(el):
+    """Деталь shared-сборки (отдельный элемент с SuperComponent)."""
+    try:
+        return el.SuperComponent is not None
+    except:
+        return False
+
 def is_structural_box_assembly(el, type_elem):
-    """Сборка-короб (опора из shared-пластин), а не профиль (уголок/двутавр/труба).
+    """Точечная сборка-короб (опора): хост shared-детей без LocationCurve.
 
-    Уголок 75×75×6 часто сам «вложенное» семейство с GeometryInstance — это всё ещё
-    линейный профиль: сечение из Structural Section, не габарит bbox 200×75.
+    Линейный хост с осью → strategy_structural_assembly_host (l + сечение сборки).
+    Shared-деталь (уголок) → обычный профиль, не короб.
     """
-    if not family_has_subcomponents(el):
+    if not is_assembly_host(el):
         return False
-
-    # Есть каталожное сечение — это профиль, даже при shared nested
-    try:
-        api_w, api_h, _api_src = get_beam_section_from_structural_api(type_elem)
-    except:
-        api_w, api_h = None, None
-    if is_positive_number(api_w) and is_positive_number(api_h):
-        return False
-    try:
-        if get_beam_diameter_from_api(type_elem) is not None:
-            return False
-    except:
-        pass
-
-    # Линейный элемент с осью — считаем балку/связь (сечение ⊥ оси)
     if element_axis_length(el) is not None:
         return False
     if get_curve_length(el) is not None:
         return False
-
     return True
+
+def expand_elements_with_shared_parts(element_list):
+    """Хост + все shared nested (рекурсивно): габариты и у сборки, и у общих деталей."""
+    out = []
+    seen = set()
+    if not element_list:
+        return out
+    for el in element_list:
+        for part in iter_family_assembly_elements(el):
+            try:
+                pid = part.Id.IntegerValue
+            except:
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(part)
+    return out
 
 def get_local_bbox_dimensions(el):
     """Bbox в локальной СК хоста: сборка (shared+geometry) → symbol → world AABB."""
@@ -1148,11 +1160,10 @@ def strategy_spatial(el, type_elem):
 # --- 5g. Structural Columns / Framing ---
 
 def strategy_nested_structural_assembly(el, type_elem):
-    """Сборка вложенных (опора и т.п.): габариты как у «короба».
+    """Точечная shared-сборка (опора): габарит короба на ХОСТЕ.
 
-    z = Высота (локальный Z / макс. вертикаль сборки),
-    x = Ширина = min(план), y = Глубина = max(план),
-    l не заполняется (Н/П на уровне диспетчера).
+    z = Высота, x = min(план), y = max(план), l очищается на уровне диспетчера.
+    Shared-детали обрабатываются отдельно своим типом/категорией.
     """
     result = {}
     dims = get_local_bbox_only(el)
@@ -1168,9 +1179,8 @@ def strategy_nested_structural_assembly(el, type_elem):
     height = None
     plan_a = None
     plan_b = None
-    src = u"assembly bbox"
+    src = u"assembly host bbox"
 
-    # Предпочитаем локальный Z как высоту (типичная ориентация семейства опоры)
     if hz is not None:
         height = hz
         plan_a, plan_b = hx, hy
@@ -1201,14 +1211,80 @@ def strategy_nested_structural_assembly(el, type_elem):
 
     return result
 
+def _order_section_min_max(width, height):
+    """Стабильный порядок сторон сечения при повороте (75×200 vs 200×75)."""
+    if width is None or height is None:
+        return (width, height)
+    try:
+        wv, hv = float(width[0]), float(height[0])
+    except:
+        return (width, height)
+    if wv > hv:
+        return (
+            (hv, u"section min ({0})".format(height[1])),
+            (wv, u"section max ({0})".format(width[1])),
+        )
+    return (width, height)
+
+def strategy_structural_assembly_host(el, type_elem):
+    """Хост shared-сборки: габарит ВСЕЙ сборки.
+
+    Линейный (есть ось): l + сечение сборки ⊥ оси (геометрия хост+детали).
+    Точечный: короб z/x/y.
+    Structural Section типа хоста не используется — это сечение детали, не сборки.
+    """
+    length = first_found([
+        get_val_inst_or_type(el, type_elem, bip("STRUCTURAL_FRAME_CUT_LENGTH")),
+        get_val_inst_or_type(el, type_elem, bip("INSTANCE_LENGTH_PARAM")),
+        get_val_inst_or_type(el, type_elem, bip("CURVE_ELEM_LENGTH")),
+        get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
+        get_val_inst_or_type(el, type_elem, bip("INSTANCE_HEIGHT_PARAM")),
+    ])
+    if length is None:
+        curve_len = element_axis_length(el)
+        if curve_len is None:
+            curve_len = get_curve_length(el)
+        if curve_len is not None:
+            length = (curve_len, u"LocationCurve (сборка)")
+
+    if length is not None and is_positive_number(length[0]):
+        result = {}
+        result["l"] = (length[0], u"{0}; габарит сборки".format(length[1]))
+        length_val = length[0]
+        bw, bh, bsrc = framing_section_perp_to_axis(el, length_val)
+        if bsrc:
+            bsrc = u"{0} (сборка host+shared)".format(bsrc)
+        width = (bw, bsrc) if bw is not None and is_plausible_beam_section(bw, length_val, trusted=True) else None
+        height = (bh, bsrc) if bh is not None and is_plausible_beam_section(bh, length_val, trusted=True) else None
+        if width is None or height is None:
+            sw, sh, ssrc = framing_section_from_bbox(el, length_val)
+            if ssrc:
+                ssrc = u"{0} (сборка host+shared)".format(ssrc)
+            if width is None and sw is not None and is_plausible_beam_section(sw, length_val, trusted=True):
+                width = (sw, ssrc)
+            if height is None and sh is not None and is_plausible_beam_section(sh, length_val, trusted=True):
+                height = (sh, ssrc)
+        width, height = normalize_thickness_vs_outer(width, height, length_val)
+        if width is not None and height is None:
+            height = (width[0], u"x=z (одна сторона сечения сборки)")
+        elif height is not None and width is None:
+            width = (height[0], u"x=z (одна сторона сечения сборки)")
+        width, height = _order_section_min_max(width, height)
+        if width is not None:
+            result["x"] = width
+        if height is not None:
+            result["z"] = height
+        return result
+
+    return strategy_nested_structural_assembly(el, type_elem)
+
 def strategy_structural_column(el, type_elem):
     """Несущие колонны.
 
-    Обычная колонна/профиль: l = высота вдоль оси, x/z = сечение, y очищается.
-    Сборка-короб (shared nested без профиля/кривой): z = Высота, x/y = план, l очищается.
+    Хост shared-сборки → габарит сборки; shared-деталь / обычный профиль → сечение типа.
     """
-    if is_structural_box_assembly(el, type_elem):
-        return strategy_nested_structural_assembly(el, type_elem)
+    if is_assembly_host(el):
+        return strategy_structural_assembly_host(el, type_elem)
 
     result = {}
 
@@ -1793,16 +1869,7 @@ def resolve_framing_section(el, type_elem, length_val):
         width = (height[0], u"x=z (одна сторона сечения)")
 
     # Стабильный порядок сторон сечения при повороте экземпляра (75×200 vs 200×75)
-    if width is not None and height is not None:
-        try:
-            wv, hv = float(width[0]), float(height[0])
-            if wv > hv:
-                width, height = (
-                    (hv, u"section min ({0})".format(height[1])),
-                    (wv, u"section max ({0})".format(width[1])),
-                )
-        except:
-            pass
+    width, height = _order_section_min_max(width, height)
 
     if width is not None and not is_plausible_beam_section(width[0], length_val, trusted=True):
         width = None
@@ -1814,11 +1881,10 @@ def resolve_framing_section(el, type_elem, length_val):
 def strategy_structural_framing(el, type_elem):
     """Балки/связи/уголки каркаса.
 
-    Обычный профиль: l = длина по оси, x/z = сечение, y очищается.
-    Сборка-короб (shared nested без профиля/кривой): z = Высота, x/y = план, l очищается.
+    Хост shared-сборки → габарит сборки; shared-деталь / обычный профиль → сечение типа.
     """
-    if is_structural_box_assembly(el, type_elem):
-        return strategy_nested_structural_assembly(el, type_elem)
+    if is_assembly_host(el):
+        return strategy_structural_assembly_host(el, type_elem)
 
     result = {}
 
@@ -2282,6 +2348,9 @@ def axis_blocked_by_strategy(axis, owned_axes, has_strategy):
 # 8. Основной цикл
 # ---------------------------------------------------------
 
+# Shared nested — отдельные элементы проекта: считаем и хост-сборку, и каждую общую деталь
+elements = expand_elements_with_shared_parts(elements)
+
 results = []
 errors = []
 sources_log = []
@@ -2316,18 +2385,21 @@ try:
             strategy_fn = STRATEGIES.get(cat_id)
             has_strategy = strategy_fn is not None
 
-            # Сборка-короб в каркасе/колоннах: Высота→z, план→x/y, l очищается
-            # (уголок/профиль с GeometryInstance сюда НЕ попадает)
+            # Shared-сборка: на хосте — габарит сборки; детали дополняются в список отдельно.
+            # Точечный короб: y пишем, l очищаем. Линейный хост: как у балки (x/z/l).
             is_nested_struct = False
             if cat_id in (CAT.get("StructuralFraming"), CAT.get("StructuralColumns")):
                 try:
-                    is_nested_struct = is_structural_box_assembly(el, type_elem)
+                    if is_assembly_host(el):
+                        is_nested_struct = is_structural_box_assembly(el, type_elem)
                 except:
                     is_nested_struct = False
                 if is_nested_struct:
                     unsupported_axes.discard("y")
                     unsupported_axes.add("l")
                     owned_axes.update(["x", "y", "z", "l"])
+                elif is_assembly_host(el):
+                    owned_axes.update(["x", "z", "l"])
 
             # --- шаг 0: категорийная стратегия ---
             if has_strategy:
