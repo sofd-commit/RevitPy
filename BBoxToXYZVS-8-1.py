@@ -1281,36 +1281,12 @@ def strategy_structural_assembly_host(el, type_elem):
 def strategy_structural_column(el, type_elem):
     """Несущие колонны.
 
-    Хост shared-сборки → габарит сборки; shared-деталь / обычный профиль → сечение типа.
+    Хост shared-сборки → габарит сборки; shared-деталь / обычный профиль → сечение + длина.
     """
     if is_assembly_host(el):
         return strategy_structural_assembly_host(el, type_elem)
 
-    result = {}
-
-    length_val = element_axis_length(el)
-    length = None
-    if length_val is not None:
-        length = (length_val, u"LocationCurve (длина оси)")
-    if length is None:
-        length = first_found([
-            get_val_inst_or_type(el, type_elem, bip("FAMILY_HEIGHT_PARAM")),
-            get_val_inst_or_type(el, type_elem, bip("INSTANCE_LENGTH_PARAM")),
-            get_val_inst_or_type(el, type_elem, bip("INSTANCE_HEIGHT_PARAM")),
-        ])
-    if length is None:
-        length = framing_overall_length_from_bbox(el)
-    if length is not None and is_positive_number(length[0]):
-        result["l"] = length
-        length_val = length[0]
-
-    width, sect_h = resolve_framing_section(el, type_elem, length_val)
-    if width is not None:
-        result["x"] = width
-    if sect_h is not None:
-        result["z"] = sect_h
-
-    return result
+    return strategy_linear_profile_piece(el, type_elem)
 
 def nearly_equal_len(a, b, rel=0.02):
     """Сравнение длин с допуском (~2%)."""
@@ -1476,6 +1452,151 @@ def get_beam_section_from_structural_api(type_elem):
     if width is None and height is None:
         return (None, None, None)
     return (width, height, u"struct: {0}".format(u", ".join(src_parts)))
+
+def _mm_to_internal(mm_val):
+    """мм → внутренние единицы Revit."""
+    try:
+        return UnitUtils.ConvertToInternalUnits(float(mm_val), UnitTypeId.Millimeters)
+    except:
+        pass
+    try:
+        return UnitUtils.ConvertToInternalUnits(float(mm_val), DisplayUnitType.DUT_MILLIMETERS)
+    except:
+        return float(mm_val) / 304.8
+
+try:
+    import re as _re
+    _PROFILE_SECTION_NAME_RE = _re.compile(
+        r"(?i)(\d+(?:[.,]\d+)?)\s*[xх×\*]\s*(\d+(?:[.,]\d+)?)(?:\s*[xх×\*]\s*(\d+(?:[.,]\d+)?))?"
+    )
+except:
+    _PROFILE_SECTION_NAME_RE = None
+
+def parse_profile_section_from_type_name(type_elem):
+    """Сечение из имени типа/семейства: «Уголок 75х75х6», «L75x75x6», «75*75*6».
+
+    Третье число (6) — толщина полки, в x/z не пишется.
+    Значения в имени считаем миллиметрами (типично для РФ).
+    """
+    if type_elem is None or _PROFILE_SECTION_NAME_RE is None:
+        return (None, None, None)
+
+    names = []
+    try:
+        names.append(type_elem.Name)
+    except:
+        pass
+    try:
+        names.append(Element.Name.__get__(type_elem))
+    except:
+        pass
+    try:
+        fam = type_elem.Family
+        if fam is not None:
+            names.append(fam.Name)
+    except:
+        pass
+
+    for raw in names:
+        if not raw:
+            continue
+        try:
+            s = unicode(raw)  # noqa: F821 — IronPython
+        except NameError:
+            s = str(raw)
+        m = _PROFILE_SECTION_NAME_RE.search(s)
+        if not m:
+            continue
+        try:
+            a = float(m.group(1).replace(",", "."))
+            b = float(m.group(2).replace(",", "."))
+        except:
+            continue
+        # Полки уголка/профиля обычно 10…1000 мм (отсекаем случайные числа из имени)
+        if a < 5 or b < 5 or a > 2000 or b > 2000:
+            continue
+        # Если есть третье число и оно << обеих полок — это толщина (6 при 75×75)
+        t = None
+        if m.group(3):
+            try:
+                t = float(m.group(3).replace(",", "."))
+            except:
+                t = None
+        if t is not None and t >= 5 and t <= 2000:
+            # «200x75x6» маловероятно; «75x50x5» — неравнополочный. Оставляем a×b.
+            # Если второе число похоже на толщину (b << a и есть t) — не наш случай
+            pass
+        wa = _mm_to_internal(a)
+        wb = _mm_to_internal(b)
+        if not is_positive_number(wa) or not is_positive_number(wb):
+            continue
+        src = u"имя: {0} → {1:g}×{2:g} мм".format(s, a, b)
+        return (wa, wb, src)
+    return (None, None, None)
+
+def element_looks_like_linear_profile(el, type_elem):
+    """Короткий уголок/профиль: сечение из имени/API или есть ось длины (не «короб» оборудования)."""
+    nw, nh, _ns = parse_profile_section_from_type_name(type_elem)
+    if nw is not None and nh is not None:
+        return True
+    api_w, api_h, _ = get_beam_section_from_structural_api(type_elem)
+    if is_positive_number(api_w) and is_positive_number(api_h):
+        return True
+    if get_beam_diameter_from_api(type_elem) is not None:
+        return True
+    if element_axis_length(el) is not None or get_curve_length(el) is not None:
+        return True
+    return False
+
+def strategy_linear_profile_piece(el, type_elem):
+    """Уголок/профиль (в т.ч. Generic Model / shared-деталь): l = длина, x/z = сечение.
+
+    Длина 200 мм не должна попадать в сечение 75×75.
+    """
+    result = {}
+    length = first_found([
+        get_val_inst_or_type(el, type_elem, bip("STRUCTURAL_FRAME_CUT_LENGTH")),
+        get_val_inst_or_type(el, type_elem, bip("INSTANCE_LENGTH_PARAM")),
+        get_val_inst_or_type(el, type_elem, bip("CURVE_ELEM_LENGTH")),
+    ])
+    if length is None:
+        curve_len = element_axis_length(el)
+        if curve_len is None:
+            curve_len = get_curve_length(el)
+        if curve_len is not None:
+            length = (curve_len, u"LocationCurve")
+    if length is None:
+        # Длина = наибольшая сторона bbox, если две другие похожи на сечение из имени/API
+        dims = get_local_bbox_only(el)
+        name_w, name_h, _ = parse_profile_section_from_type_name(type_elem)
+        if name_w is None:
+            api_w, api_h, _ = get_beam_section_from_structural_api(type_elem)
+            name_w, name_h = api_w, api_h
+        if dims is not None:
+            items = sorted(
+                [float(dims[k]) for k in ("x", "y", "z") if is_positive_number(dims.get(k))]
+            )
+            if len(items) == 3:
+                # max = длина, если она заметно больше двух других
+                if items[2] > items[1] * 1.35:
+                    length = (items[2], u"bbox max как длина профиля")
+                elif name_w is not None and name_h is not None:
+                    # выберем сторону, не совпадающую с сечением
+                    for cand in reversed(items):
+                        if (not nearly_equal_len(cand, name_w)) and (not nearly_equal_len(cand, name_h)):
+                            length = (cand, u"bbox длина ≠ сечению из имени")
+                            break
+
+    length_val = length[0] if length is not None else None
+    if length is not None:
+        result["l"] = length
+
+    width, height = resolve_framing_section(el, type_elem, length_val)
+    if width is not None:
+        result["x"] = width
+    if height is not None:
+        result["z"] = height
+    return result
 
 # Имена сечения типа (в т.ч. ADSK / СПДС). Только с типа.
 BEAM_DIAMETER_PARAM_NAMES = [
@@ -1776,7 +1897,8 @@ def framing_section_from_bbox(el, length_val):
                 break
     if length_key is None and len(items) == 3:
         ordered = sorted(items, key=lambda kv: kv[1])
-        if ordered[2][1] > ordered[1][1] * 2.0:
+        # 200 при полках 75×75: длина >> сечения (порог 1.35, не 2.0)
+        if ordered[2][1] > ordered[1][1] * 1.35:
             length_key = ordered[2][0]
 
     section_items = [(k, v) for k, v in items if k != length_key]
@@ -1812,15 +1934,14 @@ def framing_section_from_bbox(el, length_val):
     return (width, height, src)
 
 def resolve_framing_section(el, type_elem, length_val):
-    """Сечение каркаса БЕЗ Lookup по именам параметров семейства
-    (b/h/Ширина у разных семейств означают разное).
+    """Сечение каркаса / уголка.
 
-    Порядок (точные значения, без усреднения сторон):
+    Порядок:
       1) Structural Section Diameter → x=z=D
-      2) Structural Section Width/Height (всегда, в т.ч. для уголка-«вложенного»)
-      3) Геометрия ⊥ оси LocationCurve
-      4) Symbol/assembly bbox
-      + если одна сторона << другой (толщина стенки vs габарит) — обе = наружный
+      2) Structural Section Width/Height
+      3) Имя типа/семейства «75х75х6» (мм) — не путать с длиной 200
+      4) Геометрия ⊥ оси
+      5) Symbol bbox (две меньшие стороны; max ≈ длина отбрасывается)
     """
     width = None
     height = None
@@ -1831,7 +1952,7 @@ def resolve_framing_section(el, type_elem, length_val):
     if diam is not None and is_plausible_beam_section(diam[0], length_val, trusted=True):
         return ((diam[0], diam[1]), (diam[0], diam[1]))
 
-    # 2) Width/Height из Structural Section API (уголок 75×75, двутавр и т.п.)
+    # 2) Width/Height из Structural Section API
     api_w, api_h, api_src = get_beam_section_from_structural_api(type_elem)
     if api_w is not None and is_plausible_beam_section(api_w, length_val, trusted=True):
         width = (api_w, api_src)
@@ -1839,9 +1960,20 @@ def resolve_framing_section(el, type_elem, length_val):
         height = (api_h, api_src)
     width, height = normalize_thickness_vs_outer(width, height, length_val)
     if width is not None and height is not None:
-        return (width, height)
+        return _order_section_min_max(width, height)
 
-    # 3) Геометрия ⊥ оси
+    # 3) Имя типа «Уголок 75х75х6» — надёжнее bbox, когда длина = 200 мм
+    if width is None or height is None:
+        nw, nh, nsrc = parse_profile_section_from_type_name(type_elem)
+        if nw is not None and is_plausible_beam_section(nw, length_val, trusted=True):
+            width = (nw, nsrc)
+        if nh is not None and is_plausible_beam_section(nh, length_val, trusted=True):
+            height = (nh, nsrc)
+        width, height = normalize_thickness_vs_outer(width, height, length_val)
+        if width is not None and height is not None:
+            return _order_section_min_max(width, height)
+
+    # 4) Геометрия ⊥ оси
     if width is None or height is None:
         bw, bh, bsrc = framing_section_perp_to_axis(el, length_val)
         if has_shared and bsrc:
@@ -1852,7 +1984,7 @@ def resolve_framing_section(el, type_elem, length_val):
             height = (bh, bsrc)
         width, height = normalize_thickness_vs_outer(width, height, length_val)
 
-    # 4) Symbol/assembly bbox
+    # 5) Symbol/assembly bbox
     if width is None or height is None:
         sw, sh, ssrc = framing_section_from_bbox(el, length_val)
         if has_shared and ssrc:
@@ -1868,7 +2000,6 @@ def resolve_framing_section(el, type_elem, length_val):
     elif height is not None and width is None:
         width = (height[0], u"x=z (одна сторона сечения)")
 
-    # Стабильный порядок сторон сечения при повороте экземпляра (75×200 vs 200×75)
     width, height = _order_section_min_max(width, height)
 
     if width is not None and not is_plausible_beam_section(width[0], length_val, trusted=True):
@@ -1881,34 +2012,12 @@ def resolve_framing_section(el, type_elem, length_val):
 def strategy_structural_framing(el, type_elem):
     """Балки/связи/уголки каркаса.
 
-    Хост shared-сборки → габарит сборки; shared-деталь / обычный профиль → сечение типа.
+    Хост shared-сборки → габарит сборки; shared-деталь / обычный профиль → сечение + длина.
     """
     if is_assembly_host(el):
         return strategy_structural_assembly_host(el, type_elem)
 
-    result = {}
-
-    length = first_found([
-        get_val_inst_or_type(el, type_elem, bip("STRUCTURAL_FRAME_CUT_LENGTH")),
-        get_val_inst_or_type(el, type_elem, bip("INSTANCE_LENGTH_PARAM")),
-        get_val_inst_or_type(el, type_elem, bip("CURVE_ELEM_LENGTH")),
-    ])
-    if length is None:
-        curve_len = get_curve_length(el)
-        if curve_len is not None:
-            length = (curve_len, u"LocationCurve")
-
-    length_val = length[0] if length is not None else None
-    if length is not None:
-        result["l"] = length
-
-    width, height = resolve_framing_section(el, type_elem, length_val)
-    if width is not None:
-        result["x"] = width
-    if height is not None:
-        result["z"] = height
-
-    return result
+    return strategy_linear_profile_piece(el, type_elem)
 
 # --- 5h. Curtain panels / mullions ---
 
@@ -2003,11 +2112,12 @@ def _first_bip_value(el, type_elem, bip_names):
 def strategy_equipment_box(el, type_elem):
     """Оборудование/мебель/кейсворк/generic: x=min(план), y=max(план), z=высота.
 
-    Сначала built-in Width/Depth/Height; если пары плана нет — локальный/assembly bbox
-    (X/Y = план, Z = высота), затем мировой AABB. Нормализация min/max
-    схлопывает один типоразмер при разном повороте экземпляров.
-    Длина (l) этой стратегией не задаётся — для категории l = Н/П.
+    Если это уголок/профиль (имя 75х75х6, Structural Section, ось длины) —
+    считаем как линейный профиль: l=длина (200), x/z=сечение (75×75), y очищается.
     """
+    if element_looks_like_linear_profile(el, type_elem):
+        return strategy_linear_profile_piece(el, type_elem)
+
     result = {}
 
     width = _first_bip_value(el, type_elem, EQUIPMENT_WIDTH_BIP_NAMES)
@@ -2022,7 +2132,6 @@ def strategy_equipment_box(el, type_elem):
     if depth is not None:
         plan_src_parts.append(depth[1])
 
-    # Геометрия всегда под рукой: и для недостающих осей, и как стабильный план при повороте
     dims = get_local_bbox_only(el)
     src_geom = u"local/assembly bbox"
     if dims is None:
@@ -2034,7 +2143,6 @@ def strategy_equipment_box(el, type_elem):
         height = (dims["z"], u"{0} (height)".format(src_geom))
 
     if need_plan and dims is not None:
-        # Не смешиваем один BIP с одной осью bbox — берём обе план-оси из геометрии
         gx = dims.get("x") if is_positive_number(dims.get("x")) else None
         gy = dims.get("y") if is_positive_number(dims.get("y")) else None
         if gx is not None and gy is not None:
@@ -2388,6 +2496,7 @@ try:
             # Shared-сборка: на хосте — габарит сборки; детали дополняются в список отдельно.
             # Точечный короб: y пишем, l очищаем. Линейный хост: как у балки (x/z/l).
             is_nested_struct = False
+            is_profile_piece = False
             if cat_id in (CAT.get("StructuralFraming"), CAT.get("StructuralColumns")):
                 try:
                     if is_assembly_host(el):
@@ -2400,6 +2509,16 @@ try:
                     owned_axes.update(["x", "y", "z", "l"])
                 elif is_assembly_host(el):
                     owned_axes.update(["x", "z", "l"])
+            elif cat_id in EQUIPMENT_BOX_CAT_IDS:
+                # Уголок 75×75×6 длиной 200 в Generic Model и т.п. — не путать с коробом оборудования
+                try:
+                    is_profile_piece = element_looks_like_linear_profile(el, type_elem)
+                except:
+                    is_profile_piece = False
+                if is_profile_piece:
+                    unsupported_axes.discard("l")
+                    unsupported_axes.add("y")
+                    owned_axes.update(["x", "y", "z", "l"])
 
             # --- шаг 0: категорийная стратегия ---
             if has_strategy:
