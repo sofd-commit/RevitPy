@@ -1497,11 +1497,12 @@ try:
 except:
     _PROFILE_SECTION_NAME_RE = None
 
-def parse_profile_section_from_type_name(type_elem):
+def parse_profile_section_from_type_name(type_elem, require_angle_thickness=False):
     """Сечение из имени типа/семейства: «Уголок 75х75х6», «L75x75x6», «75*75*6».
 
     Третье число (6) — толщина полки, в x/z не пишется.
-    Значения в имени считаем миллиметрами (типично для РФ).
+    require_angle_thickness=True — только имена вида AxBxT, где T << A,B
+    (чтобы «Шкаф 600x400x2100» не считался уголком).
     """
     if type_elem is None or _PROFILE_SECTION_NAME_RE is None:
         return (None, None, None)
@@ -1537,20 +1538,20 @@ def parse_profile_section_from_type_name(type_elem):
             b = float(m.group(2).replace(",", "."))
         except:
             continue
-        # Полки уголка/профиля обычно 10…1000 мм (отсекаем случайные числа из имени)
         if a < 5 or b < 5 or a > 2000 or b > 2000:
             continue
-        # Если есть третье число и оно << обеих полок — это толщина (6 при 75×75)
         t = None
         if m.group(3):
             try:
                 t = float(m.group(3).replace(",", "."))
             except:
                 t = None
-        if t is not None and t >= 5 and t <= 2000:
-            # «200x75x6» маловероятно; «75x50x5» — неравнополочный. Оставляем a×b.
-            # Если второе число похоже на толщину (b << a и есть t) — не наш случай
-            pass
+        if require_angle_thickness:
+            # Уголок: третье число = толщина стенки (обычно << полок)
+            if t is None or t < 0.5 or t > 80:
+                continue
+            if t >= min(a, b) * 0.45:
+                continue
         wa = _mm_to_internal(a)
         wb = _mm_to_internal(b)
         if not is_positive_number(wa) or not is_positive_number(wb):
@@ -1559,11 +1560,14 @@ def parse_profile_section_from_type_name(type_elem):
         return (wa, wb, src)
     return (None, None, None)
 
-def element_looks_like_linear_profile(el, type_elem):
-    """Короткий уголок/профиль: сечение из имени/API или есть ось длины (не «короб» оборудования)."""
-    nw, nh, _ns = parse_profile_section_from_type_name(type_elem)
-    if nw is not None and nh is not None:
-        return True
+def element_looks_like_linear_profile(el, type_elem, for_equipment_box=False):
+    """Уголок/профиль vs короб оборудования.
+
+    for_equipment_box=True (шкаф/generic/equipment): НЕ считать профиль только
+    из «600x400» в имени — иначе пишется Длина вместо Глубины.
+    Профиль только при Structural Section / диаметре / LocationCurve /
+    имени уголка AxBxT (толщина).
+    """
     api_w, api_h, _ = get_beam_section_from_structural_api(type_elem)
     if is_positive_number(api_w) and is_positive_number(api_h):
         return True
@@ -1571,7 +1575,15 @@ def element_looks_like_linear_profile(el, type_elem):
         return True
     if element_axis_length(el) is not None or get_curve_length(el) is not None:
         return True
-    return False
+
+    if for_equipment_box:
+        nw, nh, _ns = parse_profile_section_from_type_name(
+            type_elem, require_angle_thickness=True
+        )
+        return nw is not None and nh is not None
+
+    nw, nh, _ns = parse_profile_section_from_type_name(type_elem)
+    return nw is not None and nh is not None
 
 def strategy_linear_profile_piece(el, type_elem):
     """Уголок/профиль (в т.ч. Generic Model / shared-деталь): l = длина, x/z = сечение.
@@ -2140,7 +2152,7 @@ def strategy_equipment_box(el, type_elem):
     Если это уголок/профиль (имя 75х75х6, Structural Section, ось длины) —
     считаем как линейный профиль: l=длина (200), x/z=сечение (75×75), y очищается.
     """
-    if element_looks_like_linear_profile(el, type_elem):
+    if element_looks_like_linear_profile(el, type_elem, for_equipment_box=True):
         return strategy_linear_profile_piece(el, type_elem)
 
     result = {}
@@ -2541,7 +2553,9 @@ try:
             elif cat_id in EQUIPMENT_BOX_CAT_IDS:
                 # Уголок 75×75×6 длиной 200 в Generic Model и т.п. — не путать с коробом оборудования
                 try:
-                    is_profile_piece = element_looks_like_linear_profile(el, type_elem)
+                    is_profile_piece = element_looks_like_linear_profile(
+                        el, type_elem, for_equipment_box=True
+                    )
                 except:
                     is_profile_piece = False
                 if is_profile_piece:
