@@ -37,13 +37,19 @@
 #
 #   Walls:
 #     z = высота (WALL_USER_HEIGHT_PARAM -> оценка по уровням/локальному Z),
-#     y = толщина (WALL_ATTR_WIDTH_PARAM / CompoundStructure).
-#     x = Н/П. Curtain Wall исключены (составная система).
+#     y = толщина (WALL_ATTR_WIDTH_PARAM / CompoundStructure.GetWidth = сумма слоёв).
+#     x очищается. Curtain Wall исключены (составная система).
+#     ПИМ: y → ПИМ_Размер_Толщина; ПИМ_Размер_Глубина очищается.
 #     l только по LocationCurve/built-in длины (без max(bbox)).
 #
-#   Floors, Roofs, Ceilings:
+#   Floors, Ceilings (Перекрытие, Потолок):
+#     y = толщина (CompoundStructure.GetWidth = сумма слоёв → built-in Толщина).
+#     x, z, l очищаются.
+#     ПИМ: y → ПИМ_Размер_Толщина; ПИМ_Размер_Глубина / Высота очищаются.
+#
+#   Roofs:
 #     z = CompoundStructure.GetWidth() -> built-in толщина типа.
-#     x, y, l = Н/П.
+#     x, y, l очищаются.
 #
 #   Rooms, MEPSpaces, Areas:
 #     s/v/l из SpatialElement.Area/Volume/Perimeter. x/y/z = Н/П.
@@ -935,6 +941,13 @@ strategy_windows = make_opening_strategy(WINDOW_THICKNESS_PARAM_NAMES)
 
 OPENING_CAT_IDS = set([c for c in (CAT["Doors"], CAT["Windows"]) if c is not None])
 
+# Категории, у которых ось y = толщина → ПИМ_Размер_Толщина (не Глубина)
+THICKNESS_PIM_CAT_IDS = set(OPENING_CAT_IDS)
+for _tk in ("Walls", "Floors", "Ceilings"):
+    _tcid = CAT.get(_tk)
+    if _tcid is not None:
+        THICKNESS_PIM_CAT_IDS.add(_tcid)
+
 # --- 5b. Прямые/гибкие MEP-участки ---
 
 def make_mep_strategy(width_bip_name, height_bip_name, diameter_bip_name):
@@ -1066,10 +1079,28 @@ def estimate_wall_height(el):
         return (dims["z"], u"bbox Z (оценка высоты стены)")
     return None
 
+def get_compound_structure_thickness(type_elem, src_label=None):
+    """Общая толщина типа = сумма слоёв CompoundStructure.GetWidth()."""
+    if type_elem is None:
+        return None
+    try:
+        cs = type_elem.GetCompoundStructure()
+    except:
+        cs = None
+    if cs is None:
+        return None
+    try:
+        thickness = cs.GetWidth()
+    except:
+        return None
+    if not is_positive_number(thickness):
+        return None
+    label = src_label if src_label else u"CompoundStructure (сумма слоёв)"
+    return (thickness, label)
+
 def strategy_walls(el, type_elem):
     result = {}
     if is_curtain_wall(el, type_elem):
-        # Обрабатывается как unsupported на уровне цикла (см. ниже), сюда лучше не попадать.
         return result
 
     h = get_val_inst_or_type(el, type_elem, bip("WALL_USER_HEIGHT_PARAM"))
@@ -1078,16 +1109,12 @@ def strategy_walls(el, type_elem):
     if h is not None:
         result["z"] = h
 
+    # Толщина стены: built-in Width → сумма слоёв CompoundStructure → Lookup «Толщина»
     w = get_val_inst_or_type(el, type_elem, bip("WALL_ATTR_WIDTH_PARAM"))
-    if w is None and type_elem is not None:
-        try:
-            cs = type_elem.GetCompoundStructure()
-            if cs is not None:
-                thickness = cs.GetWidth()
-                if is_positive_number(thickness):
-                    w = (thickness, u"CompoundStructure (толщина типа стены)")
-        except:
-            pass
+    if w is None:
+        w = get_compound_structure_thickness(type_elem, u"CompoundStructure (сумма слоёв стены)")
+    if w is None:
+        w = get_lookup_double(el, type_elem, [u"Толщина", u"Thickness", u"Width"])
     if w is not None:
         result["y"] = w
     return result
@@ -1100,38 +1127,36 @@ PLANAR_THICKNESS_BIPS = {
     "Ceilings": ["CEILING_THICKNESS", "CEILING_THICKNESS_PARAM"],
 }
 
-def make_planar_host_strategy(thickness_bip_names):
+def make_planar_host_strategy(thickness_bip_names, thickness_axis="z"):
+    """Планарный хост: толщина из CompoundStructure (сумма слоёв) / BIP / Lookup.
+
+    thickness_axis:
+      y — Перекрытие/Потолок → ПИМ_Размер_Толщина
+      z — Крыша (как раньше)
+    """
     def strategy(el, type_elem):
         result = {}
-        if type_elem is not None:
-            try:
-                cs = type_elem.GetCompoundStructure()
-            except:
-                cs = None
-            if cs is not None:
-                try:
-                    thickness = cs.GetWidth()
-                    if is_positive_number(thickness):
-                        result["z"] = (thickness, u"CompoundStructure (общая толщина типа)")
-                        return result
-                except:
-                    pass
-
-        for bip_name in thickness_bip_names:
-            found = get_val_inst_or_type(el, type_elem, bip(bip_name))
-            if found is not None:
-                result["z"] = found
-                break
-        if "z" not in result:
+        th = get_compound_structure_thickness(
+            type_elem, u"CompoundStructure (сумма слоёв)"
+        )
+        if th is None:
+            for bip_name in thickness_bip_names:
+                found = get_val_inst_or_type(el, type_elem, bip(bip_name))
+                if found is not None:
+                    th = found
+                    break
+        if th is None:
             th = get_lookup_double(el, type_elem, [u"Толщина", u"Thickness", u"Default Thickness"])
-            if th is not None:
-                result["z"] = th
+        if th is not None:
+            result[thickness_axis] = th
         return result
     return strategy
 
-strategy_floors = make_planar_host_strategy(PLANAR_THICKNESS_BIPS["Floors"])
-strategy_roofs = make_planar_host_strategy(PLANAR_THICKNESS_BIPS["Roofs"])
-strategy_ceilings = make_planar_host_strategy(PLANAR_THICKNESS_BIPS["Ceilings"])
+# Перекрытие / Потолок: толщина в y → ПИМ_Размер_Толщина
+strategy_floors = make_planar_host_strategy(PLANAR_THICKNESS_BIPS["Floors"], thickness_axis="y")
+strategy_ceilings = make_planar_host_strategy(PLANAR_THICKNESS_BIPS["Ceilings"], thickness_axis="y")
+# Крыша: оставляем z (пользователь просил Стена / Перекрытие / Потолок)
+strategy_roofs = make_planar_host_strategy(PLANAR_THICKNESS_BIPS["Roofs"], thickness_axis="z")
 
 # --- 5f. Rooms / MEPSpaces / Areas ---
 
@@ -2244,9 +2269,9 @@ for _key, _axes in [
     ("CableTrayFitting", set(["x", "y", "z"])),
     ("ConduitFitting", set(["x", "y", "z"])),
     ("Walls", set(["y", "z"])),
-    ("Floors", set(["z"])),
+    ("Floors", set(["y"])),
     ("Roofs", set(["z"])),
-    ("Ceilings", set(["z"])),
+    ("Ceilings", set(["y"])),
     ("Rooms", set(["s", "v", "l"])),
     ("MEPSpaces", set(["s", "v", "l"])),
     ("Areas", set(["s", "v", "l"])),
@@ -2284,10 +2309,13 @@ if CAT["StructuralFraming"] is not None:
 if CAT["StructuralColumns"] is not None:
     # У колонны Глубина (y) не пишется — сечение только x/z, высота в l.
     UNSUPPORTED_AXES[CAT["StructuralColumns"]] = set(["y"])
-for _key in ("Floors", "Roofs", "Ceilings"):
+for _key in ("Floors", "Ceilings"):
     _cid = CAT.get(_key)
     if _cid is not None:
-        UNSUPPORTED_AXES[_cid] = set(["x", "y", "l"])
+        # Толщина в y → ПИМ_Размер_Толщина; высота/длина/ширина не пишутся
+        UNSUPPORTED_AXES[_cid] = set(["x", "z", "l"])
+if CAT.get("Roofs") is not None:
+    UNSUPPORTED_AXES[CAT["Roofs"]] = set(["x", "y", "l"])
 for _key in ("Rooms", "MEPSpaces", "Areas"):
     _cid = CAT.get(_key)
     if _cid is not None:
@@ -2404,7 +2432,8 @@ def _resolve_unit_config():
 PIM_UNIT_CONFIG, PIM_UNIT_MODE = _resolve_unit_config()
 
 def get_pim_param_name(axis, cat_id):
-    if axis == "y" and cat_id in OPENING_CAT_IDS:
+    """Для проёмов/стен/перекрытий/потолков y → ПИМ_Размер_Толщина."""
+    if axis == "y" and cat_id in THICKNESS_PIM_CAT_IDS:
         return u"ПИМ_Размер_Толщина"
     return PIM_TEXT_MAP[axis]
 
@@ -2751,13 +2780,17 @@ try:
                     if status is None:
                         changed_any = True
 
-                if cat_id in OPENING_CAT_IDS:
+                if cat_id in THICKNESS_PIM_CAT_IDS:
+                    # y пишется в ПИМ_Размер_Толщина — Глубину очищаем
                     legacy_name = PIM_TEXT_MAP["y"]
                     try:
                         clear_status = set_text_param(el, legacy_name, u"")
                     except Exception as pim_ex:
                         clear_status = str(pim_ex)
-                    row[legacy_name] = clear_status if clear_status is not None else u"очищено (не применимо для проёмов)"
+                    row[legacy_name] = (
+                        clear_status if clear_status is not None
+                        else u"очищено (толщина → ПИМ_Размер_Толщина)"
+                    )
 
             sources_log.append(src_row)
 
